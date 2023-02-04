@@ -1,0 +1,11 @@
+[package]
+name = "tinytun-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.1.4", features = ["derive"] }
+hyper = { version = "0.14.23", features = ["full"] }
+hyper-tls = "0.5.0"
+rand = "0.8.5"
+tokio = { version = "1.25.0", features = ["full"] }

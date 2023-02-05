@@ -5,10 +5,13 @@ use hyper::{
     client::conn::{self, SendRequest},
     header,
     service::{make_service_fn, service_fn},
-    Body, Method, Response, Server, StatusCode,
+    Body, Method, Request, Response, Server, StatusCode,
 };
 use rand::distributions::{Alphanumeric, DistString};
-use tokio::{io, sync::Mutex, try_join};
+use tokio::{
+    sync::{Mutex, RwLock},
+    try_join,
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -22,11 +25,33 @@ struct Args {
     conn_port: u16,
 }
 
+pub struct Tunnel {
+    client: Mutex<SendRequest<Body>>,
+}
+
+impl Tunnel {
+    pub async fn request(
+        &self,
+        req: Request<Body>,
+    ) -> Result<Response<Body>, Box<dyn Error + Send + Sync>> {
+        let mut client = self.client.lock().await;
+        Ok(client.send_request(req).await?)
+    }
+}
+
+impl From<SendRequest<Body>> for Tunnel {
+    fn from(send_request: SendRequest<Body>) -> Self {
+        Tunnel {
+            client: Mutex::new(send_request),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args::parse();
 
-    let conns = Arc::new(Mutex::new(HashMap::<String, SendRequest<_>>::new()));
+    let conns = Arc::new(RwLock::new(HashMap::<String, Tunnel>::new()));
 
     let client_server = {
         let conns = conns.clone();
@@ -34,17 +59,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             move |_| {
                 let conns = conns.clone();
                 async {
-                    io::Result::Ok(service_fn(move |mut req| {
+                    Ok::<_, Box<dyn Error + Send + Sync>>(service_fn(move |mut req| {
                         let conns = conns.clone();
                         async move {
                             if req.method() != Method::CONNECT {
-                                return io::Result::Ok(
-                                    Response::builder()
-                                        .status(StatusCode::METHOD_NOT_ALLOWED)
-                                        .header("allow", "connect")
-                                        .body(Body::empty())
-                                        .unwrap(),
-                                );
+                                return Response::builder()
+                                    .status(StatusCode::METHOD_NOT_ALLOWED)
+                                    .header("allow", "connect")
+                                    .body(Body::empty());
                             }
 
                             let conn_id = Alphanumeric
@@ -56,24 +78,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 tokio::spawn(async move {
                                     if let Ok(conn) = hyper::upgrade::on(&mut req).await {
                                         if let Ok((sender, conn)) = conn::handshake(conn).await {
-                                            conns.lock().await.insert(conn_id, sender);
-                                            tokio::spawn(async move {
-                                                if let Err(err) = conn.await {
-                                                    eprintln!("Connection closed {err}");
-                                                }
-                                            });
+                                            conns.write().await.insert(conn_id, sender.into());
+                                            if let Err(err) = conn.await {
+                                                eprintln!("Connection closed {err}");
+                                            }
                                         }
                                     }
                                 });
                             }
 
-                            io::Result::Ok(
-                                Response::builder()
-                                    .status(StatusCode::SWITCHING_PROTOCOLS)
-                                    .header("x-tinytun-connection-id", conn_id)
-                                    .body(Body::empty())
-                                    .unwrap(),
-                            )
+                            Response::builder()
+                                .status(StatusCode::SWITCHING_PROTOCOLS)
+                                .header("x-tinytun-connection-id", conn_id)
+                                .body(Body::empty())
                         }
                     }))
                 }
@@ -101,17 +118,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 None => {
                                     return Ok(Response::builder()
                                         .status(StatusCode::NOT_FOUND)
-                                        .body(Body::empty())
-                                        .unwrap())
+                                        .body(Body::empty())?)
                                 }
                             };
 
-                            match conns.lock().await.get_mut(conn_id) {
-                                Some(conn) => conn.send_request(req).await,
+                            match conns.read().await.get(conn_id) {
+                                Some(conn) => conn.request(req).await,
                                 None => Ok(Response::builder()
                                     .status(StatusCode::NOT_FOUND)
-                                    .body(Body::empty())
-                                    .unwrap()),
+                                    .body(Body::empty())?),
                             }
                         }
                     }))

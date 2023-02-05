@@ -91,10 +91,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 tokio::spawn(async move {
                                     if let Ok(conn) = hyper::upgrade::on(&mut req).await {
                                         if let Ok((sender, conn)) = conn::handshake(conn).await {
-                                            conns.write().await.insert(conn_id, sender.into());
+                                            conns.write().await.insert(conn_id.clone(), sender.into());
                                             if let Err(err) = conn.await {
                                                 eprintln!("Connection closed {err}");
                                             }
+                                            conns.write().await.remove(&conn_id);
                                         }
                                     }
                                 });

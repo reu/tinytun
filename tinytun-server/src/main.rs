@@ -69,9 +69,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                     .body(Body::empty());
                             }
 
-                            let conn_id = Alphanumeric
-                                .sample_string(&mut rand::thread_rng(), 16)
-                                .to_lowercase();
+                            let conn_id = req
+                                .headers()
+                                .get("x-tinytun-connection-id")
+                                .and_then(|conn_id| conn_id.to_str().ok())
+                                .map(|conn_id| conn_id.to_owned())
+                                .unwrap_or_else(|| {
+                                    Alphanumeric
+                                        .sample_string(&mut rand::thread_rng(), 16)
+                                        .to_lowercase()
+                                });
+
+                            if conns.read().await.contains_key(&conn_id) {
+                                return Response::builder()
+                                    .status(StatusCode::CONFLICT)
+                                    .body(Body::from("Subdomain already in use"));
+                            };
 
                             {
                                 let conn_id = conn_id.clone();

@@ -16,12 +16,16 @@ struct Args {
     port: u16,
 
     /// Connection management port
-    #[arg(short, long, default_value_t = Uri::from_static("http://local.tinytun.com:5554"))]
+    #[arg(long, default_value_t = Uri::from_static("http://local.tinytun.com:5554"))]
     server_url: Uri,
 
     /// Proxy URL
     #[arg(long, default_value_t = Uri::from_static("http://local.tinytun.com:5555"))]
     proxy_url: Uri,
+
+    /// Subdomain to use
+    #[arg(short, long)]
+    subdomain: Option<String>,
 }
 
 #[tokio::main]
@@ -36,12 +40,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let res = Client::builder()
         .build(HttpsConnector::new())
-        .request(
-            Request::builder()
+        .request({
+            let req = Request::builder()
                 .uri(args.server_url)
-                .method(Method::CONNECT)
-                .body(Body::empty())?,
-        )
+                .method(Method::CONNECT);
+
+            match args.subdomain {
+                Some(subdomain) if !subdomain.trim().is_empty() => req
+                    .header("x-tinytun-connection-id", subdomain)
+                    .body(Body::empty())?,
+                _ => req.body(Body::empty())?,
+            }
+        })
         .await?;
 
     let conn_id = res

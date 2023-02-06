@@ -113,7 +113,7 @@ impl TunnelEntry {
         self.subdomain.as_str()
     }
 
-    pub async fn add_tunnel(mut self, tunnel: Tunnel) {
+    pub async fn add_tunnel(&mut self, tunnel: Tunnel) {
         self.registry
             .tunnels
             .write()

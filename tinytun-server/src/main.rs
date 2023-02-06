@@ -7,7 +7,7 @@ use hyper::{
     service::{make_service_fn, service_fn},
     Body, Method, Response, Server, StatusCode,
 };
-use tokio::try_join;
+use tokio::{io::AsyncReadExt, try_join};
 
 use tunnel::Tunnels;
 
@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 .and_then(|subdomain| subdomain.to_str().ok())
                                 .map(|subdomain| subdomain.to_owned());
 
-                            let tun_entry = match tuns.new_tunnel(subdomain.clone()).await {
+                            let mut tun_entry = match tuns.new_tunnel(subdomain.clone()).await {
                                 Ok(entry) => entry,
                                 Err(_) => {
                                     return Response::builder()
@@ -69,15 +69,27 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 .body(Body::empty())?;
 
                             tokio::spawn(async move {
-                                if let Ok(tun) = hyper::upgrade::on(&mut req).await {
-                                    if let Ok((sender, tun)) = conn::handshake(tun).await {
-                                        let tun_id = tun_entry.id();
-                                        tun_entry.add_tunnel(sender.into()).await;
-                                        if let Err(err) = tun.await {
-                                            eprintln!("Connection closed {err}");
+                                if let Ok(mut conn) = hyper::upgrade::on(&mut req).await {
+                                    let tun_id = tun_entry.id();
+
+                                    loop {
+                                        if let Ok((sender, tun)) = conn::handshake(conn).await {
+                                            tun_entry.add_tunnel(sender.into()).await;
+                                            match tun.without_shutdown().await {
+                                                Ok(mut parts) => {
+                                                    parts.io.read(&mut [0; 1024 * 4]).await.ok();
+                                                    conn = parts.io;
+                                                    continue;
+                                                }
+                                                Err(err) => {
+                                                    eprintln!("Connection closed {err}");
+                                                    break;
+                                                }
+                                            }
                                         }
-                                        tuns.remove_tunnel(tun_id).await;
+                                        break;
                                     }
+                                    tuns.remove_tunnel(tun_id).await;
                                 }
                             });
 

@@ -1,17 +1,17 @@
-use std::{collections::HashMap, error::Error, net::SocketAddr, sync::Arc};
+use std::{error::Error, net::SocketAddr, sync::Arc};
 
 use clap::Parser;
 use hyper::{
-    client::conn::{self, SendRequest},
+    client::conn,
     header,
     service::{make_service_fn, service_fn},
-    Body, Method, Request, Response, Server, StatusCode,
+    Body, Method, Response, Server, StatusCode,
 };
-use rand::distributions::{Alphanumeric, DistString};
-use tokio::{
-    sync::{Mutex, RwLock},
-    try_join,
-};
+use tokio::try_join;
+
+use tunnel::Tunnels;
+
+mod tunnel;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -25,42 +25,20 @@ struct Args {
     conn_port: u16,
 }
 
-pub struct Tunnel {
-    client: Mutex<SendRequest<Body>>,
-}
-
-impl Tunnel {
-    pub async fn request(
-        &self,
-        req: Request<Body>,
-    ) -> Result<Response<Body>, Box<dyn Error + Send + Sync>> {
-        let mut client = self.client.lock().await;
-        Ok(client.send_request(req).await?)
-    }
-}
-
-impl From<SendRequest<Body>> for Tunnel {
-    fn from(send_request: SendRequest<Body>) -> Self {
-        Tunnel {
-            client: Mutex::new(send_request),
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args::parse();
 
-    let conns = Arc::new(RwLock::new(HashMap::<String, Tunnel>::new()));
+    let tuns = Arc::new(Tunnels::new());
 
     let client_server = {
-        let conns = conns.clone();
+        let tuns = tuns.clone();
         Server::bind(&SocketAddr::from(([0, 0, 0, 0], args.conn_port))).serve(make_service_fn(
             move |_| {
-                let conns = conns.clone();
+                let tuns = tuns.clone();
                 async {
                     Ok::<_, Box<dyn Error + Send + Sync>>(service_fn(move |mut req| {
-                        let conns = conns.clone();
+                        let tuns = tuns.clone();
                         async move {
                             if req.method() != Method::CONNECT {
                                 return Response::builder()
@@ -69,42 +47,41 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                     .body(Body::empty());
                             }
 
-                            let conn_id = req
+                            let subdomain = req
                                 .headers()
-                                .get("x-tinytun-connection-id")
-                                .and_then(|conn_id| conn_id.to_str().ok())
-                                .map(|conn_id| conn_id.to_owned())
-                                .unwrap_or_else(|| {
-                                    Alphanumeric
-                                        .sample_string(&mut rand::thread_rng(), 16)
-                                        .to_lowercase()
-                                });
+                                .get("x-tinytun-subdomain")
+                                .and_then(|subdomain| subdomain.to_str().ok())
+                                .map(|subdomain| subdomain.to_owned());
 
-                            if conns.read().await.contains_key(&conn_id) {
-                                return Response::builder()
-                                    .status(StatusCode::CONFLICT)
-                                    .body(Body::from("Subdomain already in use"));
+                            let tun_entry = match tuns.new_tunnel(subdomain.clone()).await {
+                                Ok(entry) => entry,
+                                Err(_) => {
+                                    return Response::builder()
+                                        .status(StatusCode::CONFLICT)
+                                        .body(Body::from("Subdomain not available"));
+                                }
                             };
 
-                            {
-                                let conn_id = conn_id.clone();
-                                tokio::spawn(async move {
-                                    if let Ok(conn) = hyper::upgrade::on(&mut req).await {
-                                        if let Ok((sender, conn)) = conn::handshake(conn).await {
-                                            conns.write().await.insert(conn_id.clone(), sender.into());
-                                            if let Err(err) = conn.await {
-                                                eprintln!("Connection closed {err}");
-                                            }
-                                            conns.write().await.remove(&conn_id);
-                                        }
-                                    }
-                                });
-                            }
-
-                            Response::builder()
+                            let res = Response::builder()
                                 .status(StatusCode::SWITCHING_PROTOCOLS)
-                                .header("x-tinytun-connection-id", conn_id)
-                                .body(Body::empty())
+                                .header("x-tinytun-connection-id", tun_entry.id().to_string())
+                                .header("x-tinytun-subdomain", tun_entry.subdomain())
+                                .body(Body::empty())?;
+
+                            tokio::spawn(async move {
+                                if let Ok(tun) = hyper::upgrade::on(&mut req).await {
+                                    if let Ok((sender, tun)) = conn::handshake(tun).await {
+                                        let tun_id = tun_entry.id();
+                                        tun_entry.add_tunnel(sender.into()).await;
+                                        if let Err(err) = tun.await {
+                                            eprintln!("Connection closed {err}");
+                                        }
+                                        tuns.remove_tunnel(tun_id).await;
+                                    }
+                                }
+                            });
+
+                            Ok(res)
                         }
                     }))
                 }
@@ -113,13 +90,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
 
     let proxy = {
-        let conns = conns.clone();
+        let tuns = tuns.clone();
         Server::bind(&SocketAddr::from(([0, 0, 0, 0], args.proxy_port))).serve(make_service_fn(
             move |_| {
-                let conns = conns.clone();
+                let tuns = tuns.clone();
                 async {
                     Ok::<_, Box<dyn Error + Send + Sync>>(service_fn(move |req| {
-                        let conns = conns.clone();
+                        let tuns = tuns.clone();
                         async move {
                             let host = req
                                 .headers()
@@ -127,7 +104,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 .and_then(|host| host.to_str().ok())
                                 .unwrap_or_default();
 
-                            let conn_id = match host.split_once('.').map(|(conn_id, _)| conn_id) {
+                            let tun_id = match host.split_once('.').map(|(tun_id, _)| tun_id) {
                                 Some(id) => id,
                                 None => {
                                     return Ok(Response::builder()
@@ -136,8 +113,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 }
                             };
 
-                            match conns.read().await.get(conn_id) {
-                                Some(conn) => conn.request(req).await,
+                            match tuns.tunnel_for_subdomain(tun_id).await {
+                                Some(tun) => tun.request(req).await,
                                 None => Ok(Response::builder()
                                     .status(StatusCode::NOT_FOUND)
                                     .body(Body::empty())?),

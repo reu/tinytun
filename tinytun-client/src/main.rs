@@ -1,7 +1,7 @@
-use std::{error::Error, sync::Arc};
+use std::{error::Error, process::exit, sync::Arc};
 
 use clap::Parser;
-use hyper::{server::conn, service::service_fn, upgrade, Body, Client, Method, Request, Uri};
+use hyper::{body, server::conn, service::service_fn, upgrade, Body, Client, Method, Request, Uri};
 use hyper_tls::HttpsConnector;
 
 use crate::proxy::ReverseProxy;
@@ -47,16 +47,32 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
             match args.subdomain {
                 Some(subdomain) if !subdomain.trim().is_empty() => req
-                    .header("x-tinytun-connection-id", subdomain)
+                    .header("x-tinytun-subdomain", subdomain)
                     .body(Body::empty())?,
                 _ => req.body(Body::empty())?,
             }
         })
         .await?;
 
+    if res.status().is_client_error() {
+        let message = body::to_bytes(res.into_body())
+            .await
+            .ok()
+            .and_then(|body| {
+                std::str::from_utf8(&body)
+                    .map(|message| message.to_owned())
+                    .ok()
+            })
+            .unwrap_or_else(|| "Couldn't retrive connection".to_string());
+
+        println!("Error: {message}");
+
+        exit(1)
+    }
+
     let conn_id = res
         .headers()
-        .get("x-tinytun-connection-id")
+        .get("x-tinytun-subdomain")
         .ok_or("Server didn't provide a connection id")?
         .to_str()?;
 

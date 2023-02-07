@@ -1,12 +1,9 @@
-use std::{error::Error, process::exit, sync::Arc};
+use std::{error::Error, process::exit};
 
 use clap::Parser;
-use hyper::{body, server::conn, service::service_fn, upgrade, Body, Client, Method, Request, Uri};
+use hyper::{body, upgrade, Body, Client, Method, Request, Uri};
 use hyper_tls::HttpsConnector;
-
-use crate::proxy::ReverseProxy;
-
-mod proxy;
+use tokio::{io, net::TcpStream};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -31,12 +28,6 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args::parse();
-
-    let target = Uri::builder()
-        .scheme("http")
-        .authority(format!("localhost:{}", args.port))
-        .path_and_query("/")
-        .build()?;
 
     let res = Client::builder()
         .build(HttpsConnector::new())
@@ -87,18 +78,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     println!("Forwarding via: {proxy_url}");
 
-    let proxy = Arc::new(ReverseProxy::new());
+    let mut remote = upgrade::on(res).await?;
+    let mut local = TcpStream::connect(format!("localhost:{}", args.port)).await?;
 
-    conn::Http::new()
-        .serve_connection(
-            upgrade::on(res).await?,
-            service_fn(|req| {
-                let target = target.clone();
-                let proxy = proxy.clone();
-                async move { proxy.proxy(&target, req).await }
-            }),
-        )
-        .await?;
+    io::copy_bidirectional(&mut remote, &mut local).await?;
 
     Ok(())
 }

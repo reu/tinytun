@@ -72,17 +72,27 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 if let Ok(mut conn) = hyper::upgrade::on(&mut req).await {
                                     let tun_id = tun_entry.id();
 
-                                    loop {
+                                    'outer: loop {
                                         if let Ok((sender, tun)) = conn::handshake(conn).await {
                                             tun_entry.add_tunnel(sender.into()).await;
                                             match tun.without_shutdown().await {
-                                                Ok(mut parts) => {
-                                                    parts.io.read(&mut [0; 1024 * 4]).await.ok();
-                                                    conn = parts.io;
+                                                Ok(parts) => {
+                                                    let mut stream = parts.io;
+                                                    loop {
+                                                        match stream.read(&mut [0; 1024]).await {
+                                                            Ok(bytes) if bytes < 1024 => break,
+                                                            Err(err) => {
+                                                                eprintln!("closed {err}");
+                                                                break 'outer;
+                                                            }
+                                                            _ => continue,
+                                                        }
+                                                    }
+                                                    conn = stream;
                                                     continue;
                                                 }
                                                 Err(err) => {
-                                                    eprintln!("Connection closed {err}");
+                                                    eprintln!("closed {err}");
                                                     break;
                                                 }
                                             }

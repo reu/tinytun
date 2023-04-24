@@ -1,8 +1,9 @@
-use std::{collections::HashMap, error::Error, fmt::Display, sync::Arc};
+use std::{error::Error, fmt::Display, sync::Arc};
 
+use dashmap::DashMap;
 use hyper::{client::conn::SendRequest, Body, Request, Response};
 use rand::{thread_rng, Rng};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct Tunnel {
@@ -47,15 +48,15 @@ impl Display for TunnelId {
 }
 
 pub struct Tunnels {
-    tunnels: RwLock<HashMap<TunnelId, (Tunnel, String)>>,
-    subdomains: RwLock<HashMap<String, TunnelId>>,
+    tunnels: DashMap<TunnelId, (Tunnel, String)>,
+    subdomains: DashMap<String, TunnelId>,
 }
 
 impl Tunnels {
     pub fn new() -> Self {
         Self {
-            tunnels: RwLock::new(HashMap::new()),
-            subdomains: RwLock::new(HashMap::new()),
+            tunnels: DashMap::new(),
+            subdomains: DashMap::new(),
         }
     }
 
@@ -66,33 +67,28 @@ impl Tunnels {
         let tun_id = TunnelId::new();
         let subdomain = subdomain.unwrap_or_else(|| tun_id.to_string());
 
-        if self.subdomains.read().await.contains_key(&subdomain) {
+        if self.subdomains.contains_key(&subdomain) {
             return Err("Subdomain already in use".into());
         }
-        self.subdomains
-            .write()
-            .await
-            .insert(subdomain.clone(), tun_id);
+
+        self.subdomains.insert(subdomain.clone(), tun_id);
+
         Ok(TunnelEntry {
             tun_id,
-            subdomain: subdomain.clone(),
+            subdomain,
             registry: self.clone(),
             persisted: false,
         })
     }
 
     pub async fn tunnel_for_subdomain(&self, subdomain: &str) -> Option<Tunnel> {
-        let tun_id = self.subdomains.read().await.get(subdomain).cloned()?;
-        self.tunnels
-            .read()
-            .await
-            .get(&tun_id)
-            .map(|(tun, _)| tun.clone())
+        let tun_id = self.subdomains.get(subdomain)?;
+        self.tunnels.get(&tun_id).map(|tun| tun.value().0.clone())
     }
 
     pub async fn remove_tunnel(&self, tun_id: TunnelId) {
-        if let Some((_, subdomain)) = self.tunnels.write().await.remove(&tun_id) {
-            self.subdomains.write().await.remove(&subdomain);
+        if let Some((_, (_, subdomain))) = self.tunnels.remove(&tun_id) {
+            self.subdomains.remove(&subdomain);
         }
     }
 }
@@ -116,8 +112,6 @@ impl TunnelEntry {
     pub async fn add_tunnel(&mut self, tunnel: Tunnel) {
         self.registry
             .tunnels
-            .write()
-            .await
             .insert(self.tun_id, (tunnel, self.subdomain.clone()));
         self.persisted = true;
     }
@@ -129,7 +123,7 @@ impl Drop for TunnelEntry {
             let subdomain = self.subdomain.clone();
             let tunnels = self.registry.clone();
             tokio::spawn(async move {
-                tunnels.subdomains.write().await.remove(&subdomain);
+                tunnels.subdomains.remove(&subdomain);
             });
         }
     }

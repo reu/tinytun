@@ -1,13 +1,13 @@
 use std::{error::Error, fmt::Display, sync::Arc};
 
+use bytes::Bytes;
 use dashmap::DashMap;
-use hyper::{client::conn::SendRequest, Body, Request, Response};
+use hyper::{body::HttpBody, header, Body, HeaderMap, Request, Response};
 use rand::{thread_rng, Rng};
-use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct Tunnel {
-    client: Arc<Mutex<SendRequest<Body>>>,
+    client: h2::client::SendRequest<Bytes>,
 }
 
 impl Tunnel {
@@ -15,15 +15,40 @@ impl Tunnel {
         &self,
         req: Request<Body>,
     ) -> Result<Response<Body>, Box<dyn Error + Send + Sync>> {
-        let mut client = self.client.lock().await;
-        Ok(client.send_request(req).await?)
+        let mut sender = self.client.clone().ready().await?;
+        let (mut req, mut body) = req.into_parts();
+        remove_hop_by_hop_headers(&mut req.headers);
+        let (res, mut send_stream) = sender.send_request(Request::from_parts(req, ()), false)?;
+
+        tokio::spawn(async move {
+            while let Some(chunk) = body.data().await {
+                send_stream.send_data(chunk?, false)?;
+            }
+            send_stream.send_data(Bytes::default(), true)?;
+            Ok::<_, Box<dyn Error + Send + Sync>>(())
+        });
+
+        let res = res.await?;
+        let (mut res, mut proxy_body) = res.into_parts();
+        remove_hop_by_hop_headers(&mut res.headers);
+
+        let (mut out, res_body) = Body::channel();
+
+        tokio::spawn(async move {
+            while let Some(chunk) = proxy_body.data().await {
+                out.send_data(chunk?).await?;
+            }
+            Ok::<_, Box<dyn Error + Send + Sync>>(())
+        });
+
+        Ok(Response::from_parts(res, res_body))
     }
 }
 
-impl From<SendRequest<Body>> for Tunnel {
-    fn from(send_request: SendRequest<Body>) -> Self {
+impl From<h2::client::SendRequest<Bytes>> for Tunnel {
+    fn from(send_request: h2::client::SendRequest<Bytes>) -> Self {
         Tunnel {
-            client: Arc::new(Mutex::new(send_request)),
+            client: send_request,
         }
     }
 }
@@ -126,5 +151,16 @@ impl Drop for TunnelEntry {
                 tunnels.subdomains.remove(&subdomain);
             });
         }
+    }
+}
+
+fn remove_hop_by_hop_headers(headers: &mut HeaderMap) {
+    for key in &[
+        header::CONTENT_LENGTH,
+        header::TRANSFER_ENCODING,
+        header::ACCEPT_ENCODING,
+        header::CONTENT_ENCODING,
+    ] {
+        headers.remove(key);
     }
 }

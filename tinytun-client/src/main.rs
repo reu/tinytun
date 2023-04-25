@@ -1,9 +1,20 @@
-use std::{error::Error, process::exit};
+use std::{
+    error::Error,
+    future::Future,
+    pin::Pin,
+    process::exit,
+    task::{self, Poll},
+};
 
+use bytes::Bytes;
 use clap::Parser;
-use hyper::{body, upgrade, Body, Client, Method, Request, Uri};
+use hyper::{
+    body::{self, HttpBody},
+    header, upgrade, Body, Client, HeaderMap, Method, Request, Uri, Version,
+};
 use hyper_tls::HttpsConnector;
-use tokio::{io, net::TcpStream};
+use tokio::{io, net::TcpStream, try_join};
+use tower::Service;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -23,6 +34,10 @@ struct Args {
     /// Subdomain to use
     #[arg(short, long)]
     subdomain: Option<String>,
+
+    /// Maximum number of local connections allowed to keep open
+    #[arg(long, default_value_t = 4)]
+    pool_size: usize,
 }
 
 #[tokio::main]
@@ -78,10 +93,97 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     println!("Forwarding via: {proxy_url}");
 
-    let mut remote = upgrade::on(res).await?;
-    let mut local = TcpStream::connect(format!("localhost:{}", args.port)).await?;
+    let client = Client::builder()
+        .pool_max_idle_per_host(args.pool_size)
+        .build::<_, hyper::Body>(LocalConnector { port: args.port });
 
-    io::copy_bidirectional(&mut remote, &mut local).await?;
+    let local_uri = format!("http://localhost:{}", args.port)
+        .as_str()
+        .parse::<Uri>()
+        .unwrap();
+
+    let remote = upgrade::on(res).await?;
+    let mut connection = h2::server::handshake(remote).await?;
+    while let Some(result) = connection.accept().await {
+        let client = client.clone();
+        let local_uri = local_uri.clone();
+        let (remote_req, mut remote_respond) = result?;
+        tokio::spawn(async move {
+            let (mut remote_req, mut remote_body) = remote_req.into_parts();
+            remove_hop_by_hop_headers(&mut remote_req.headers);
+            remote_req.uri = local_uri;
+            remote_req.version = Version::HTTP_11;
+
+            let (mut local_body_sender, local_body) = Body::channel();
+
+            let local = async move {
+                while let Some(data) = remote_body.data().await {
+                    let data = data?;
+                    remote_body.flow_control().release_capacity(data.len()).ok();
+                    if !data.is_empty() {
+                        local_body_sender.send_data(data).await?;
+                    }
+                }
+
+                Ok::<_, Box<dyn Error + Send + Sync>>(())
+            };
+
+            let remote = async move {
+                let local_res = client
+                    .request(Request::from_parts(remote_req, local_body))
+                    .await?;
+
+                let (mut local_res, mut local_res_body) = local_res.into_parts();
+                remove_hop_by_hop_headers(&mut local_res.headers);
+
+                let remote_res = hyper::Response::from_parts(local_res, ());
+                let mut send = remote_respond.send_response(remote_res, false)?;
+
+                while let Some(data) = local_res_body.data().await {
+                    let data = data?;
+                    send.send_data(data, false)?;
+                }
+                send.send_data(Bytes::default(), true)?;
+                Ok::<_, Box<dyn Error + Send + Sync>>(())
+            };
+
+            if let Err(err) = try_join!(local, remote) {
+                println!("Error: {err}");
+            }
+
+            Ok::<_, Box<dyn Error + Send + Sync>>(())
+        });
+    }
 
     Ok(())
+}
+
+fn remove_hop_by_hop_headers(headers: &mut HeaderMap) {
+    for key in &[
+        header::CONTENT_LENGTH,
+        header::TRANSFER_ENCODING,
+        header::ACCEPT_ENCODING,
+        header::CONTENT_ENCODING,
+    ] {
+        headers.remove(key);
+    }
+}
+
+#[derive(Clone)]
+struct LocalConnector {
+    port: u16,
+}
+
+impl Service<Uri> for LocalConnector {
+    type Response = TcpStream;
+    type Error = io::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _: Uri) -> Self::Future {
+        Box::pin(TcpStream::connect(format!("localhost:{}", self.port)))
+    }
 }

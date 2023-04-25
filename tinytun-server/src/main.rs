@@ -2,12 +2,11 @@ use std::{error::Error, net::SocketAddr, sync::Arc};
 
 use clap::Parser;
 use hyper::{
-    client::conn,
     header,
     service::{make_service_fn, service_fn},
     Body, Method, Response, Server, StatusCode,
 };
-use tokio::{io::AsyncReadExt, try_join};
+use tokio::try_join;
 
 use tunnel::Tunnels;
 
@@ -69,36 +68,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 .body(Body::empty())?;
 
                             tokio::spawn(async move {
-                                if let Ok(mut conn) = hyper::upgrade::on(&mut req).await {
+                                if let Ok(conn) = hyper::upgrade::on(&mut req).await {
                                     let tun_id = tun_entry.id();
 
-                                    'outer: loop {
-                                        if let Ok((sender, tun)) = conn::handshake(conn).await {
-                                            tun_entry.add_tunnel(sender.into()).await;
-                                            match tun.without_shutdown().await {
-                                                Ok(parts) => {
-                                                    let mut stream = parts.io;
-                                                    loop {
-                                                        match stream.read(&mut [0; 1024]).await {
-                                                            Ok(bytes) if bytes < 1024 => break,
-                                                            Err(err) => {
-                                                                eprintln!("closed {err}");
-                                                                break 'outer;
-                                                            }
-                                                            _ => continue,
-                                                        }
-                                                    }
-                                                    conn = stream;
-                                                    continue;
-                                                }
-                                                Err(err) => {
-                                                    eprintln!("closed {err}");
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        break;
+                                    let (client, h2) = h2::client::handshake(conn).await.unwrap();
+                                    tun_entry.add_tunnel(client.into()).await;
+
+                                    if let Err(err) = h2.await {
+                                        println!("Error: {err}");
                                     }
+
                                     tuns.remove_tunnel(tun_id).await;
                                 }
                             });

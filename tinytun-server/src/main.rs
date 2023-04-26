@@ -1,4 +1,9 @@
-use std::{error::Error, net::SocketAddr, sync::Arc};
+use std::{
+    error::Error,
+    io::{BufRead, Cursor},
+    net::SocketAddr,
+    sync::Arc,
+};
 
 use clap::Parser;
 use hyper::{
@@ -6,7 +11,7 @@ use hyper::{
     service::{make_service_fn, service_fn},
     Body, Method, Response, Server, StatusCode,
 };
-use tokio::try_join;
+use tokio::{io::AsyncWriteExt, net::TcpListener, try_join};
 
 use tunnel::Tunnels;
 
@@ -30,10 +35,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let tuns = Arc::new(Tunnels::new());
 
-    let client_server = {
+    let client_server = async {
         let tuns = tuns.clone();
-        Server::bind(&SocketAddr::from(([0, 0, 0, 0], args.conn_port))).serve(make_service_fn(
-            move |_| {
+        Server::bind(&SocketAddr::from(([0, 0, 0, 0], args.conn_port)))
+            .serve(make_service_fn(move |_| {
                 let tuns = tuns.clone();
                 async {
                     Ok::<_, Box<dyn Error + Send + Sync>>(service_fn(move |mut req| {
@@ -86,14 +91,72 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         }
                     }))
                 }
-            },
-        ))
+            }))
+            .await?;
+
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
     };
 
-    let proxy = {
+    let tcp_proxy = async {
         let tuns = tuns.clone();
-        Server::bind(&SocketAddr::from(([0, 0, 0, 0], args.proxy_port))).serve(make_service_fn(
-            move |_| {
+        let addr = SocketAddr::from(([0, 0, 0, 0], args.proxy_port));
+        let listener = TcpListener::bind(&addr).await?;
+
+        while let Ok((mut stream, _addr)) = listener.accept().await {
+            let mut buf = vec![0; 1024];
+            let host = loop {
+                let peeked = stream.peek(&mut buf).await?;
+                if peeked == 0 {
+                    return Err("Empty stream".into());
+                }
+                let mut cursor = Cursor::new(&buf);
+                if cursor.read_line(&mut String::new())? == 0 {
+                    continue;
+                }
+                let position = cursor.position() as usize;
+                drop(cursor);
+                let mut headers = [httparse::EMPTY_HEADER; 10];
+                httparse::parse_headers(&mut buf[position..], &mut headers)?;
+
+                let host = headers
+                    .iter()
+                    .find(|header| header.name == header::HOST)
+                    .and_then(|header| std::str::from_utf8(header.value).ok());
+
+                if let Some(host) = host {
+                    break host.to_string();
+                }
+            };
+
+            let tun_id = match host.split_once('.').map(|(tun_id, _)| tun_id) {
+                Some(id) => id,
+                None => {
+                    stream
+                        .write_all(b"HTTP/1.1 404\ncontent-length: 0\n\n")
+                        .await?;
+                    break;
+                }
+            };
+
+            match tuns.tunnel_for_subdomain(tun_id).await {
+                Some(tun) => {
+                    tun.tunnel(stream).await?;
+                }
+                None => {
+                    stream
+                        .write_all(b"HTTP/1.1 404\ncontent-length: 0\n\n")
+                        .await?;
+                    break;
+                }
+            }
+        }
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    };
+
+    let proxy = async {
+        let tuns = tuns.clone();
+        Server::bind(&SocketAddr::from(([0, 0, 0, 0], args.proxy_port + 1)))
+            .serve(make_service_fn(move |_| {
                 let tuns = tuns.clone();
                 async {
                     Ok::<_, Box<dyn Error + Send + Sync>>(service_fn(move |req| {
@@ -123,11 +186,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         }
                     }))
                 }
-            },
-        ))
+            }))
+            .await?;
+
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
     };
 
-    try_join!(client_server, proxy)?;
+    try_join!(client_server, proxy, tcp_proxy)?;
 
     Ok(())
 }

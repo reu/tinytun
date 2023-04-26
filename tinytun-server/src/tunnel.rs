@@ -1,9 +1,13 @@
 use std::{error::Error, fmt::Display, sync::Arc};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
-use hyper::{body::HttpBody, header, Body, HeaderMap, Request, Response};
+use hyper::{body::HttpBody, header, Body, HeaderMap, Method, Request, Response};
 use rand::{thread_rng, Rng};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 
 #[derive(Debug, Clone)]
 pub struct Tunnel {
@@ -42,6 +46,60 @@ impl Tunnel {
         });
 
         Ok(Response::from_parts(res, res_body))
+    }
+
+    pub async fn tunnel(&self, stream: TcpStream) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut sender = self.client.clone().ready().await?;
+
+        let req = Request::builder()
+            .uri("http://localhost")
+            .method(Method::POST)
+            .body(())?;
+
+        let (res, mut send_stream) = sender.send_request(req, false)?;
+
+        let (mut reader, mut writer) = stream.into_split();
+
+        let write = async move {
+            loop {
+                let mut buf = vec![0; 1024];
+                match reader.read(&mut buf).await? {
+                    0 => {
+                        println!("Finishing");
+                        send_stream.send_data(Bytes::default(), true)?;
+                        break;
+                    }
+                    n => {
+                        let buf = BytesMut::from(&buf[0..n]);
+                        // send_stream.reserve_capacity(n);
+                        println!("Sending {buf:?}");
+                        send_stream.send_data(buf.into(), false)?;
+                        println!("Sent");
+                    }
+                }
+            }
+            Ok::<_, Box<dyn Error + Send + Sync>>(())
+        };
+
+        tokio::spawn(write);
+
+        let res = res.await?;
+        let mut res_body = res.into_body();
+
+        let read = async move {
+            while let Some(chunk) = res_body.data().await {
+                println!("Read {chunk:?}");
+                writer.write_all_buf(&mut chunk?).await?;
+            }
+
+            Ok::<_, Box<dyn Error + Send + Sync>>(())
+        };
+
+        read.await?;
+
+        // try_join!(write, read)?;
+
+        Ok(())
     }
 }
 

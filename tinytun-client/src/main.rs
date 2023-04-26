@@ -6,14 +6,18 @@ use std::{
     task::{self, Poll},
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use hyper::{
     body::{self, HttpBody},
-    header, upgrade, Body, Client, HeaderMap, Method, Request, Uri, Version,
+    header, upgrade, Body, Client, HeaderMap, Method, Request, Response, StatusCode, Uri, Version,
 };
 use hyper_tls::HttpsConnector;
-use tokio::{io, net::TcpStream, try_join};
+use tokio::{
+    io::{self, AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    try_join,
+};
 use tower::Service;
 
 #[derive(Parser, Debug)]
@@ -107,7 +111,58 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     while let Some(result) = connection.accept().await {
         let client = client.clone();
         let local_uri = local_uri.clone();
-        let (remote_req, mut remote_respond) = result?;
+        let (mut remote_req, mut remote_respond) = result?;
+
+        if remote_req.method() == Method::POST {
+            let remote_body = remote_req.body_mut();
+            let local_stream = TcpStream::connect(format!("localhost:{}", args.port)).await?;
+            let (mut reader, mut writer) = local_stream.into_split();
+
+            let read = async move {
+                println!("COME ON WHERE IS MY BODY?");
+                while let Some(data) = remote_body.data().await {
+                    println!("DATA {data:?}");
+                    let mut data = data?;
+                    remote_body.flow_control().release_capacity(data.len()).ok();
+                    writer.write_all_buf(&mut data).await?;
+                }
+
+                println!("WAT?");
+
+                Ok::<_, Box<dyn Error + Send + Sync>>(())
+            };
+
+            // tokio::spawn(read);
+
+            let res = Response::builder().status(StatusCode::OK).body(())?;
+            let mut send_stream = remote_respond.send_response(res, false)?;
+            println!("Sent response");
+
+            let write = async move {
+                println!("WRITING");
+                loop {
+                    let mut buf = vec![0; 1024];
+                    match reader.read(&mut buf).await? {
+                        0 => {
+                            println!("Finishing");
+                            send_stream.send_data(Bytes::default(), true)?;
+                            break;
+                        }
+                        n => {
+                            let buf = BytesMut::from(&buf[0..n]);
+                            println!("Sending {buf:?}");
+                            send_stream.send_data(buf.into(), false)?;
+                        }
+                    }
+                }
+                Ok::<_, Box<dyn Error + Send + Sync>>(())
+            };
+
+            try_join!(read, write)?;
+
+            return Ok::<_, Box<dyn Error + Send + Sync>>(());
+        }
+
         tokio::spawn(async move {
             let (mut remote_req, mut remote_body) = remote_req.into_parts();
             remove_hop_by_hop_headers(&mut remote_req.headers);

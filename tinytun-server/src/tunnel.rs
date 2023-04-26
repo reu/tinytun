@@ -51,28 +51,26 @@ impl Tunnel {
     pub async fn tunnel(&self, stream: TcpStream) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut sender = self.client.clone().ready().await?;
 
-        let req = Request::builder().method(Method::PATCH).body(())?;
-
-        let (res, mut send_stream) = sender.send_request(req, false)?;
+        let (res, mut send_stream) = sender.send_request(Request::new(()), false)?;
 
         let (mut reader, mut writer) = stream.into_split();
 
         let write = async move {
-            println!("Writing");
+            // println!("Writing");
             loop {
                 let mut buf = vec![0; 1024];
                 match reader.read(&mut buf).await? {
                     0 => {
-                        println!("Finishing writing");
+                        // println!("Finishing writing");
                         send_stream.send_data(Bytes::default(), true).unwrap();
-                        println!("Done writing");
+                        // println!("Done writing");
                         break;
                     }
                     n => {
                         let buf = BytesMut::from(&buf[0..n]);
-                        println!("Sending {buf:?}");
+                        // println!("Sending {buf:?}");
                         send_stream.send_data(buf.into(), false)?;
-                        println!("Sent");
+                        // println!("Sent");
                     }
                 }
             }
@@ -81,23 +79,23 @@ impl Tunnel {
         };
 
         let read = async move {
-            println!("Reading");
+            // println!("Reading");
             let mut res = res.await?;
-            println!("Got response {res:?}");
+            println!("Got response {}", res.status());
             while let Some(chunk) = res.body_mut().data().await {
-                println!("Read {chunk:?}");
+                // println!("Read {chunk:?}");
                 // writer.write_all_buf(&mut chunk?).await?;
                 // writer.flush().await?;
 
                 writer.write_all(&chunk?).await?;
-                writer.flush().await?;
+                // writer.flush().await?;
             }
             println!("Closing read");
-
             Ok::<_, Box<dyn Error + Send + Sync>>(())
         };
 
         tokio::try_join!(write, read)?;
+        println!("Closing");
 
         Ok(())
     }

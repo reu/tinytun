@@ -116,7 +116,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         return Err("Empty stream".into());
                     }
                     let mut cursor = Cursor::new(&buf);
-                    if cursor.read_line(&mut String::new())? == 0 {
+                    if cursor.read_line(&mut String::with_capacity(peeked / 2))? == 0 {
                         continue;
                     }
                     let position = cursor.position() as usize;
@@ -146,7 +146,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
                 match tuns.tunnel_for_subdomain(tun_id).await {
                     Some(tun) => {
+                        println!("Starting tunnel");
                         tun.tunnel(stream).await?;
+                        println!("Finishing tunnel");
                     }
                     None => {
                         stream

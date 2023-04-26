@@ -76,12 +76,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 if let Ok(conn) = hyper::upgrade::on(&mut req).await {
                                     let tun_id = tun_entry.id();
 
-                                    let (client, h2) = h2::client::handshake(conn).await.unwrap();
-                                    tun_entry.add_tunnel(client.into()).await;
+                                    if let Ok((client, h2)) = h2::client::handshake(conn).await {
+                                        println!("Conn established");
+                                        tun_entry.add_tunnel(client.into()).await;
 
-                                    if let Err(err) = h2.await {
-                                        println!("Error: {err}");
+                                        if let Err(err) = h2.await {
+                                            println!("Error: {err}");
+                                        }
                                     }
+
+                                    println!("Closing conn");
 
                                     tuns.remove_tunnel(tun_id).await;
                                 }
@@ -103,52 +107,55 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let listener = TcpListener::bind(&addr).await?;
 
         while let Ok((mut stream, _addr)) = listener.accept().await {
-            let mut buf = vec![0; 1024];
-            let host = loop {
-                let peeked = stream.peek(&mut buf).await?;
-                if peeked == 0 {
-                    return Err("Empty stream".into());
-                }
-                let mut cursor = Cursor::new(&buf);
-                if cursor.read_line(&mut String::new())? == 0 {
-                    continue;
-                }
-                let position = cursor.position() as usize;
-                drop(cursor);
-                let mut headers = [httparse::EMPTY_HEADER; 10];
-                httparse::parse_headers(&mut buf[position..], &mut headers)?;
+            let tuns = tuns.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0; 1024];
+                let host = loop {
+                    let peeked = stream.peek(&mut buf).await?;
+                    if peeked == 0 {
+                        return Err("Empty stream".into());
+                    }
+                    let mut cursor = Cursor::new(&buf);
+                    if cursor.read_line(&mut String::new())? == 0 {
+                        continue;
+                    }
+                    let position = cursor.position() as usize;
+                    drop(cursor);
+                    let mut headers = [httparse::EMPTY_HEADER; 10];
+                    httparse::parse_headers(&mut buf[position..], &mut headers)?;
 
-                let host = headers
-                    .iter()
-                    .find(|header| header.name == header::HOST)
-                    .and_then(|header| std::str::from_utf8(header.value).ok());
+                    let host = headers
+                        .iter()
+                        .find(|header| header.name == header::HOST)
+                        .and_then(|header| std::str::from_utf8(header.value).ok());
 
-                if let Some(host) = host {
-                    break host.to_string();
-                }
-            };
+                    if let Some(host) = host {
+                        break host.to_string();
+                    }
+                };
 
-            let tun_id = match host.split_once('.').map(|(tun_id, _)| tun_id) {
-                Some(id) => id,
-                None => {
-                    stream
-                        .write_all(b"HTTP/1.1 404\ncontent-length: 0\n\n")
-                        .await?;
-                    break;
-                }
-            };
+                let tun_id = match host.split_once('.').map(|(tun_id, _)| tun_id) {
+                    Some(id) => id,
+                    None => {
+                        stream
+                            .write_all(b"HTTP/1.1 404\ncontent-length: 0\n\n")
+                            .await?;
+                        return Ok::<_, Box<dyn Error + Send + Sync>>(());
+                    }
+                };
 
-            match tuns.tunnel_for_subdomain(tun_id).await {
-                Some(tun) => {
-                    tun.tunnel(stream).await?;
-                }
-                None => {
-                    stream
-                        .write_all(b"HTTP/1.1 404\ncontent-length: 0\n\n")
-                        .await?;
-                    break;
-                }
-            }
+                match tuns.tunnel_for_subdomain(tun_id).await {
+                    Some(tun) => {
+                        tun.tunnel(stream).await?;
+                    }
+                    None => {
+                        stream
+                            .write_all(b"HTTP/1.1 404\ncontent-length: 0\n\n")
+                            .await?;
+                    }
+                };
+                Ok::<_, Box<dyn Error + Send + Sync>>(())
+            });
         }
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     };

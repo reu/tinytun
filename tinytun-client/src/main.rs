@@ -10,7 +10,7 @@ use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use hyper::{
     body::{self, HttpBody},
-    header, upgrade, Body, Client, HeaderMap, Method, Request, Response, StatusCode, Uri, Version,
+    header, upgrade, Body, Client, HeaderMap, Method, Request, Response, Uri, Version,
 };
 use hyper_tls::HttpsConnector;
 use tokio::{
@@ -111,35 +111,34 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     while let Some(result) = connection.accept().await {
         let client = client.clone();
         let local_uri = local_uri.clone();
-        let (mut remote_req, mut remote_respond) = result?;
+        let (remote_req, mut remote_respond) = result?;
 
-        if remote_req.method() == Method::POST {
-            let remote_body = remote_req.body_mut();
+        if remote_req.method() == Method::PATCH {
+            println!("Tunneling {remote_req:?}");
+            let mut remote_body = remote_req.into_body();
             let local_stream = TcpStream::connect(format!("localhost:{}", args.port)).await?;
             let (mut reader, mut writer) = local_stream.into_split();
 
             let read = async move {
-                println!("COME ON WHERE IS MY BODY?");
+                println!("Reading from tunnel");
                 while let Some(data) = remote_body.data().await {
-                    println!("DATA {data:?}");
-                    let mut data = data?;
+                    println!("Data from tunnel: {data:?}");
+                    let data = data?;
                     remote_body.flow_control().release_capacity(data.len()).ok();
-                    writer.write_all_buf(&mut data).await?;
+                    writer.write_all(&data).await?;
                 }
 
-                println!("WAT?");
+                println!("Finished reading from tunnel");
 
                 Ok::<_, Box<dyn Error + Send + Sync>>(())
             };
 
-            // tokio::spawn(read);
-
-            let res = Response::builder().status(StatusCode::OK).body(())?;
+            let res = Response::new(());
             let mut send_stream = remote_respond.send_response(res, false)?;
             println!("Sent response");
 
             let write = async move {
-                println!("WRITING");
+                println!("Writing to tunnel");
                 loop {
                     let mut buf = vec![0; 1024];
                     match reader.read(&mut buf).await? {
@@ -155,10 +154,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         }
                     }
                 }
+                println!("Closing writing to tunnel");
                 Ok::<_, Box<dyn Error + Send + Sync>>(())
             };
 
-            try_join!(read, write)?;
+            if let Err(err) = try_join!(read, write) {
+                println!("Error: {err}");
+            }
 
             return Ok::<_, Box<dyn Error + Send + Sync>>(());
         }

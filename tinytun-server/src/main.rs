@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let tuns = Arc::new(Tunnels::new());
 
-    let client_server = async {
+    let api = async {
         let tuns = tuns.clone();
         Server::bind(&SocketAddr::from(([0, 0, 0, 0], args.conn_port)))
             .serve(make_service_fn(move |_| {
@@ -77,15 +77,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                     let tun_id = tun_entry.id();
 
                                     if let Ok((client, h2)) = h2::client::handshake(conn).await {
-                                        println!("Conn established");
                                         tun_entry.add_tunnel(client.into()).await;
 
                                         if let Err(err) = h2.await {
-                                            println!("Error: {err}");
+                                            eprintln!("Error: {err}");
                                         }
                                     }
-
-                                    println!("Closing conn");
 
                                     tuns.remove_tunnel(tun_id).await;
                                 }
@@ -119,10 +116,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     if cursor.read_line(&mut String::with_capacity(peeked / 2))? == 0 {
                         continue;
                     }
-                    let position = cursor.position() as usize;
-                    drop(cursor);
-                    let mut headers = [httparse::EMPTY_HEADER; 10];
-                    httparse::parse_headers(&mut buf[position..], &mut headers)?;
+                    let position = cursor.position().try_into()?;
+                    let mut headers = [httparse::EMPTY_HEADER; 16];
+                    httparse::parse_headers(&buf[position..], &mut headers)?;
 
                     let host = headers
                         .iter()
@@ -146,9 +142,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
                 match tuns.tunnel_for_subdomain(tun_id).await {
                     Some(tun) => {
-                        println!("Starting tunnel");
                         tun.tunnel(stream).await?;
-                        println!("Finishing tunnel");
                     }
                     None => {
                         stream
@@ -162,46 +156,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     };
 
-    let proxy = async {
-        let tuns = tuns.clone();
-        Server::bind(&SocketAddr::from(([0, 0, 0, 0], args.proxy_port + 1)))
-            .serve(make_service_fn(move |_| {
-                let tuns = tuns.clone();
-                async {
-                    Ok::<_, Box<dyn Error + Send + Sync>>(service_fn(move |req| {
-                        let tuns = tuns.clone();
-                        async move {
-                            let host = req
-                                .headers()
-                                .get(header::HOST)
-                                .and_then(|host| host.to_str().ok())
-                                .unwrap_or_default();
-
-                            let tun_id = match host.split_once('.').map(|(tun_id, _)| tun_id) {
-                                Some(id) => id,
-                                None => {
-                                    return Ok(Response::builder()
-                                        .status(StatusCode::NOT_FOUND)
-                                        .body(Body::empty())?)
-                                }
-                            };
-
-                            match tuns.tunnel_for_subdomain(tun_id).await {
-                                Some(tun) => tun.request(req).await,
-                                None => Ok(Response::builder()
-                                    .status(StatusCode::NOT_FOUND)
-                                    .body(Body::empty())?),
-                            }
-                        }
-                    }))
-                }
-            }))
-            .await?;
-
-        Ok::<_, Box<dyn Error + Send + Sync>>(())
-    };
-
-    try_join!(client_server, proxy, tcp_proxy)?;
+    try_join!(api, tcp_proxy)?;
 
     Ok(())
 }

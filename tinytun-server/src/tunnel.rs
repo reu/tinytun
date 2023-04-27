@@ -2,7 +2,7 @@ use std::{error::Error, fmt::Display, sync::Arc};
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
-use hyper::{body::HttpBody, header, Body, HeaderMap, Method, Request, Response};
+use hyper::Request;
 use rand::{thread_rng, Rng};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -15,39 +15,6 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
-    pub async fn request(
-        &self,
-        req: Request<Body>,
-    ) -> Result<Response<Body>, Box<dyn Error + Send + Sync>> {
-        let mut sender = self.client.clone().ready().await?;
-        let (mut req, mut body) = req.into_parts();
-        remove_hop_by_hop_headers(&mut req.headers);
-        let (res, mut send_stream) = sender.send_request(Request::from_parts(req, ()), false)?;
-
-        tokio::spawn(async move {
-            while let Some(chunk) = body.data().await {
-                send_stream.send_data(chunk?, false)?;
-            }
-            send_stream.send_data(Bytes::default(), true)?;
-            Ok::<_, Box<dyn Error + Send + Sync>>(())
-        });
-
-        let res = res.await?;
-        let (mut res, mut proxy_body) = res.into_parts();
-        remove_hop_by_hop_headers(&mut res.headers);
-
-        let (mut out, res_body) = Body::channel();
-
-        tokio::spawn(async move {
-            while let Some(chunk) = proxy_body.data().await {
-                out.send_data(chunk?).await?;
-            }
-            Ok::<_, Box<dyn Error + Send + Sync>>(())
-        });
-
-        Ok(Response::from_parts(res, res_body))
-    }
-
     pub async fn tunnel(&self, stream: TcpStream) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut sender = self.client.clone().ready().await?;
 
@@ -56,46 +23,35 @@ impl Tunnel {
         let (mut reader, mut writer) = stream.into_split();
 
         let write = async move {
-            // println!("Writing");
             loop {
-                let mut buf = vec![0; 1024];
+                let mut buf = vec![0; 8 * 1024];
                 match reader.read(&mut buf).await? {
                     0 => {
-                        // println!("Finishing writing");
                         send_stream.send_data(Bytes::default(), true).unwrap();
-                        // println!("Done writing");
                         break;
                     }
                     n => {
                         let buf = BytesMut::from(&buf[0..n]);
-                        // println!("Sending {buf:?}");
                         send_stream.send_data(buf.into(), false)?;
-                        // println!("Sent");
                     }
                 }
             }
-            println!("Closing write");
             Ok::<_, Box<dyn Error + Send + Sync>>(())
         };
 
         let read = async move {
-            // println!("Reading");
-            let mut res = res.await?;
-            println!("Got response {}", res.status());
-            while let Some(chunk) = res.body_mut().data().await {
-                // println!("Read {chunk:?}");
-                // writer.write_all_buf(&mut chunk?).await?;
-                // writer.flush().await?;
-
-                writer.write_all(&chunk?).await?;
-                // writer.flush().await?;
+            let res = res.await?;
+            let mut body = res.into_body();
+            let mut flow_control = body.flow_control().clone();
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk?;
+                flow_control.release_capacity(chunk.len())?;
+                writer.write_all(&chunk).await?;
             }
-            println!("Closing read");
             Ok::<_, Box<dyn Error + Send + Sync>>(())
         };
 
         tokio::try_join!(write, read)?;
-        println!("Closing");
 
         Ok(())
     }
@@ -207,16 +163,5 @@ impl Drop for TunnelEntry {
                 tunnels.subdomains.remove(&subdomain);
             });
         }
-    }
-}
-
-fn remove_hop_by_hop_headers(headers: &mut HeaderMap) {
-    for key in &[
-        header::CONTENT_LENGTH,
-        header::TRANSFER_ENCODING,
-        header::ACCEPT_ENCODING,
-        header::CONTENT_ENCODING,
-    ] {
-        headers.remove(key);
     }
 }

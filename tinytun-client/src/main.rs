@@ -1,21 +1,14 @@
-use std::{
-    error::Error,
-    future::Future,
-    pin::Pin,
-    process::exit,
-    task::{self, Poll},
-};
+use std::{error::Error, process::exit};
 
 use bytes::{Bytes, BytesMut};
 use clap::Parser;
-use hyper::{body, header, upgrade, Body, Client, HeaderMap, Method, Request, Response, Uri};
+use hyper::{body, upgrade, Body, Client, Method, Request, Response, Uri};
 use hyper_tls::HttpsConnector;
 use tokio::{
-    io::{self, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     try_join,
 };
-use tower::Service;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -100,134 +93,45 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let (remote_req, mut remote_respond) = result?;
 
         tokio::spawn(async move {
-            // println!("Tunneling {remote_req:?}");
             let mut remote_body = remote_req.into_body();
             let local_stream = TcpStream::connect(format!("localhost:{}", args.port)).await?;
             let (mut reader, mut writer) = local_stream.into_split();
 
             let read = async move {
-                // println!("Reading from tunnel");
+                let mut flow_control = remote_body.flow_control().clone();
                 while let Some(data) = remote_body.data().await {
-                    // println!("Data from tunnel: {data:?}");
                     let data = data?;
-                    // remote_body.flow_control().release_capacity(data.len()).ok();
+                    flow_control.release_capacity(data.len())?;
                     writer.write_all(&data).await?;
                 }
-
-                println!("Finished reading from tunnel");
-
                 Ok::<_, Box<dyn Error + Send + Sync>>(())
             };
 
-            let res = Response::new(());
-            let mut send_stream = remote_respond.send_response(res, false)?;
-            // println!("Sent response");
-
             let write = async move {
-                // println!("Writing to tunnel");
+                let mut send_stream = remote_respond.send_response(Response::new(()), false)?;
                 let mut buf = vec![0; 8 * 1024];
                 loop {
                     match reader.read(&mut buf).await? {
                         0 => {
-                            // println!("Finishing writing");
                             send_stream.send_data(Bytes::default(), true)?;
                             break;
                         }
                         n => {
                             let buf = BytesMut::from(&buf[0..n]);
-                            // println!("Sending {buf:?}");
                             send_stream.send_data(buf.into(), false)?;
                         }
                     }
                 }
-                println!("Closing writing to tunnel");
                 Ok::<_, Box<dyn Error + Send + Sync>>(())
             };
 
             if let Err(err) = try_join!(read, write) {
-                println!("Error: {err}");
+                eprintln!("Error: {err}");
             }
-
-            println!("Done");
 
             Ok::<_, Box<dyn Error + Send + Sync>>(())
         });
-        // tokio::spawn(async move {
-        //     let (mut remote_req, mut remote_body) = remote_req.into_parts();
-        //     remove_hop_by_hop_headers(&mut remote_req.headers);
-        //     remote_req.uri = local_uri;
-        //     remote_req.version = Version::HTTP_11;
-        //
-        //     let (mut local_body_sender, local_body) = Body::channel();
-        //
-        //     let local = async move {
-        //         while let Some(data) = remote_body.data().await {
-        //             let data = data?;
-        //             remote_body.flow_control().release_capacity(data.len()).ok();
-        //             if !data.is_empty() {
-        //                 local_body_sender.send_data(data).await?;
-        //             }
-        //         }
-        //
-        //         Ok::<_, Box<dyn Error + Send + Sync>>(())
-        //     };
-        //
-        //     let remote = async move {
-        //         let local_res = client
-        //             .request(Request::from_parts(remote_req, local_body))
-        //             .await?;
-        //
-        //         let (mut local_res, mut local_res_body) = local_res.into_parts();
-        //         remove_hop_by_hop_headers(&mut local_res.headers);
-        //
-        //         let remote_res = hyper::Response::from_parts(local_res, ());
-        //         let mut send = remote_respond.send_response(remote_res, false)?;
-        //
-        //         while let Some(data) = local_res_body.data().await {
-        //             let data = data?;
-        //             send.send_data(data, false)?;
-        //         }
-        //         send.send_data(Bytes::default(), true)?;
-        //         Ok::<_, Box<dyn Error + Send + Sync>>(())
-        //     };
-        //
-        //     if let Err(err) = try_join!(local, remote) {
-        //         println!("Error: {err}");
-        //     }
-        //
-        //     Ok::<_, Box<dyn Error + Send + Sync>>(())
-        // });
     }
 
     Ok(())
 }
-
-// fn remove_hop_by_hop_headers(headers: &mut HeaderMap) {
-//     for key in &[
-//         header::CONTENT_LENGTH,
-//         header::TRANSFER_ENCODING,
-//         header::ACCEPT_ENCODING,
-//         header::CONTENT_ENCODING,
-//     ] {
-//         headers.remove(key);
-//     }
-// }
-//
-// #[derive(Clone)]
-// struct LocalConnector {
-//     port: u16,
-// }
-//
-// impl Service<Uri> for LocalConnector {
-//     type Response = TcpStream;
-//     type Error = io::Error;
-//     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-//
-//     fn poll_ready(&mut self, _: &mut task::Context<'_>) -> Poll<Result<(), Self::Error>> {
-//         Poll::Ready(Ok(()))
-//     }
-//
-//     fn call(&mut self, _: Uri) -> Self::Future {
-//         Box::pin(TcpStream::connect(format!("localhost:{}", self.port)))
-//     }
-// }

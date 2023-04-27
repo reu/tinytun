@@ -8,6 +8,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
+use tracing::{trace, instrument};
 
 #[derive(Debug, Clone)]
 pub struct Tunnel {
@@ -15,6 +16,7 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
+    #[instrument(skip(self, stream))]
     pub async fn tunnel(&self, stream: TcpStream) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut sender = self.client.clone().ready().await?;
 
@@ -27,10 +29,12 @@ impl Tunnel {
                 let mut buf = vec![0; 8 * 1024];
                 match reader.read(&mut buf).await? {
                     0 => {
+                        trace!("Finishing writing");
                         send_stream.send_data(Bytes::default(), true).unwrap();
                         break;
                     }
                     n => {
+                        trace!(bytes = n, "Writing");
                         let buf = BytesMut::from(&buf[0..n]);
                         send_stream.send_data(buf.into(), false)?;
                     }
@@ -40,14 +44,18 @@ impl Tunnel {
         };
 
         let read = async move {
+            trace!("Sending request");
             let res = res.await?;
+            trace!(status = %res.status(), "Upstream response");
             let mut body = res.into_body();
             let mut flow_control = body.flow_control().clone();
             while let Some(chunk) = body.data().await {
                 let chunk = chunk?;
+                trace!(bytes = chunk.len(), "Reading");
                 flow_control.release_capacity(chunk.len())?;
                 writer.write_all(&chunk).await?;
             }
+            trace!("Finishing reading");
             Ok::<_, Box<dyn Error + Send + Sync>>(())
         };
 

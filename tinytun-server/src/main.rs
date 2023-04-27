@@ -8,7 +8,7 @@ use std::{
 use clap::Parser;
 use hyper::{
     header,
-    server::conn::Http as HttpServer,
+    server::conn::{AddrIncoming, Http as HttpServer},
     service::{make_service_fn, service_fn},
     Body, Method, Response, Server, StatusCode,
 };
@@ -17,6 +17,8 @@ use tokio::{
     try_join,
 };
 
+use tracing::{debug, info, metadata::LevelFilter, trace, Instrument};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use tunnel::Tunnels;
 
 mod tunnel;
@@ -35,13 +37,27 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::ERROR.into())
+                .from_env_lossy(),
+        )
+        .init();
+
     let args = Args::parse();
 
     let tuns = Arc::new(Tunnels::new());
 
     let api = async {
         let tuns = tuns.clone();
-        Server::bind(&SocketAddr::from(([0, 0, 0, 0], args.conn_port)))
+
+        let addr = SocketAddr::from(([0, 0, 0, 0], args.conn_port));
+        let listener = TcpListener::bind(&addr).await?;
+        info!("API running on port {}", args.conn_port);
+
+        Server::builder(AddrIncoming::from_listener(listener)?)
             .serve(make_service_fn(move |_| {
                 let tuns = tuns.clone();
                 async {
@@ -50,8 +66,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         async move {
                             if req.method() != Method::CONNECT {
                                 return Response::builder()
-                                    .status(StatusCode::METHOD_NOT_ALLOWED)
-                                    .header("allow", "connect")
+                                    .status(StatusCode::OK)
                                     .body(Body::empty());
                             }
 
@@ -70,27 +85,35 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 }
                             };
 
+                            let subdomain = tun_entry.subdomain().to_string();
+                            let tun_id = tun_entry.id();
+
                             let res = Response::builder()
                                 .status(StatusCode::SWITCHING_PROTOCOLS)
-                                .header("x-tinytun-connection-id", tun_entry.id().to_string())
-                                .header("x-tinytun-subdomain", tun_entry.subdomain())
+                                .header("x-tinytun-connection-id", tun_id.to_string())
+                                .header("x-tinytun-subdomain", &subdomain)
                                 .body(Body::empty())?;
 
-                            tokio::spawn(async move {
-                                if let Ok(conn) = hyper::upgrade::on(&mut req).await {
-                                    let tun_id = tun_entry.id();
+                            tokio::spawn(
+                                async move {
+                                    if let Ok(conn) = hyper::upgrade::on(&mut req).await {
+                                        trace!("Tunnel opened");
 
-                                    if let Ok((client, h2)) = h2::client::handshake(conn).await {
-                                        tun_entry.add_tunnel(client.into()).await;
+                                        if let Ok((client, h2)) = h2::client::handshake(conn).await
+                                        {
+                                            tun_entry.add_tunnel(client.into()).await;
 
-                                        if let Err(err) = h2.await {
-                                            eprintln!("Error: {err}");
+                                            if let Err(err) = h2.await {
+                                                debug!(error = %err, "Error");
+                                            }
                                         }
-                                    }
 
-                                    tuns.remove_tunnel(tun_id).await;
+                                        tuns.remove_tunnel(tun_id).await;
+                                        trace!("Tunnel closed");
+                                    }
                                 }
-                            });
+                                .instrument(tracing::trace_span!("Tunnel", %subdomain)),
+                            );
 
                             Ok(res)
                         }
@@ -106,6 +129,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let tuns = tuns.clone();
         let addr = SocketAddr::from(([0, 0, 0, 0], args.proxy_port));
         let listener = TcpListener::bind(&addr).await?;
+        info!("Proxy running on port {}", args.proxy_port);
 
         while let Ok((stream, _addr)) = listener.accept().await {
             let tuns = tuns.clone();
@@ -131,7 +155,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
                 match tuns.tunnel_for_subdomain(subdomain).await {
                     Some(tun) => {
-                        tun.tunnel(stream).await?;
+                        tun.tunnel(stream)
+                            .instrument(tracing::trace_span!("Tunneling", subdomain))
+                            .await?;
                     }
                     None => {
                         HttpServer::new()

@@ -101,6 +101,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 let mut flow_control = remote_body.flow_control().clone();
                 while let Some(data) = remote_body.data().await {
                     let data = data?;
+                    if data.is_empty() {
+                        break;
+                    }
                     flow_control.release_capacity(data.len())?;
                     writer.write_all(&data).await?;
                 }

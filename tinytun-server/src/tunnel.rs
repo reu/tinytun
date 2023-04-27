@@ -51,6 +51,9 @@ impl Tunnel {
             let mut flow_control = body.flow_control().clone();
             while let Some(chunk) = body.data().await {
                 let chunk = chunk?;
+                if chunk.is_empty() {
+                    break;
+                }
                 trace!(bytes = chunk.len(), "Reading");
                 flow_control.release_capacity(chunk.len())?;
                 writer.write_all(&chunk).await?;

@@ -8,10 +8,14 @@ use std::{
 use clap::Parser;
 use hyper::{
     header,
+    server::conn::Http as HttpServer,
     service::{make_service_fn, service_fn},
     Body, Method, Response, Server, StatusCode,
 };
-use tokio::{io::AsyncWriteExt, net::TcpListener, try_join};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    try_join,
+};
 
 use tunnel::Tunnels;
 
@@ -103,50 +107,42 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let addr = SocketAddr::from(([0, 0, 0, 0], args.proxy_port));
         let listener = TcpListener::bind(&addr).await?;
 
-        while let Ok((mut stream, _addr)) = listener.accept().await {
+        while let Ok((stream, _addr)) = listener.accept().await {
             let tuns = tuns.clone();
             tokio::spawn(async move {
-                let mut buf = vec![0; 1024];
-                let host = loop {
-                    let peeked = stream.peek(&mut buf).await?;
-                    if peeked == 0 {
-                        return Err("Empty stream".into());
-                    }
-                    let mut cursor = Cursor::new(&buf);
-                    if cursor.read_line(&mut String::with_capacity(peeked / 2))? == 0 {
-                        continue;
-                    }
-                    let position = cursor.position().try_into()?;
-                    let mut headers = [httparse::EMPTY_HEADER; 16];
-                    httparse::parse_headers(&buf[position..], &mut headers)?;
+                let host = peek_host(&stream).await?;
 
-                    let host = headers
-                        .iter()
-                        .find(|header| header.name == header::HOST)
-                        .and_then(|header| std::str::from_utf8(header.value).ok());
-
-                    if let Some(host) = host {
-                        break host.to_string();
-                    }
-                };
-
-                let tun_id = match host.split_once('.').map(|(tun_id, _)| tun_id) {
+                let subdomain = match host.split_once('.').map(|(tun_id, _)| tun_id) {
                     Some(id) => id,
                     None => {
-                        stream
-                            .write_all(b"HTTP/1.1 404\ncontent-length: 0\n\n")
+                        HttpServer::new()
+                            .serve_connection(
+                                stream,
+                                service_fn(|_| async {
+                                    Response::builder()
+                                        .status(StatusCode::NOT_FOUND)
+                                        .body(Body::from("Tunnel not informed"))
+                                }),
+                            )
                             .await?;
                         return Ok::<_, Box<dyn Error + Send + Sync>>(());
                     }
                 };
 
-                match tuns.tunnel_for_subdomain(tun_id).await {
+                match tuns.tunnel_for_subdomain(subdomain).await {
                     Some(tun) => {
                         tun.tunnel(stream).await?;
                     }
                     None => {
-                        stream
-                            .write_all(b"HTTP/1.1 404\ncontent-length: 0\n\n")
+                        HttpServer::new()
+                            .serve_connection(
+                                stream,
+                                service_fn(|_| async {
+                                    Response::builder()
+                                        .status(StatusCode::NOT_FOUND)
+                                        .body(Body::from("Tunnel not found"))
+                                }),
+                            )
                             .await?;
                     }
                 };
@@ -159,4 +155,30 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     try_join!(api, tcp_proxy)?;
 
     Ok(())
+}
+
+async fn peek_host(stream: &TcpStream) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let mut buf = vec![0; 1024];
+    loop {
+        let peeked = stream.peek(&mut buf).await?;
+        if peeked == 0 {
+            return Err("Empty stream".into());
+        }
+        let mut cursor = Cursor::new(&buf);
+        if cursor.read_line(&mut String::with_capacity(peeked / 2))? == 0 {
+            continue;
+        }
+        let position = cursor.position().try_into()?;
+        let mut headers = [httparse::EMPTY_HEADER; 16];
+        httparse::parse_headers(&buf[position..], &mut headers)?;
+
+        let host = headers
+            .iter()
+            .find(|header| header.name == header::HOST)
+            .and_then(|header| std::str::from_utf8(header.value).ok());
+
+        if let Some(host) = host {
+            break Ok(host.to_string());
+        }
+    }
 }

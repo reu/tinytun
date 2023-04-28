@@ -3,7 +3,7 @@ use std::{error::Error, process::exit};
 use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use hyper::{body, upgrade, Body, Client, Method, Request, Response, Uri};
-use hyper_tls::HttpsConnector;
+use hyper_rustls::HttpsConnectorBuilder;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -49,7 +49,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args::parse();
 
     let res = Client::builder()
-        .build(HttpsConnector::new())
+        .build(
+            HttpsConnectorBuilder::new()
+                .with_native_roots()
+                .https_or_http()
+                .enable_http1()
+                .build(),
+        )
         .request({
             let req = Request::builder()
                 .uri(args.server_url)

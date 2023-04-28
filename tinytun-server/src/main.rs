@@ -3,6 +3,7 @@ use std::{
     io::{BufRead, Cursor},
     net::SocketAddr,
     sync::Arc,
+    time::Duration,
 };
 
 use clap::Parser;
@@ -14,6 +15,7 @@ use hyper::{
 };
 use tokio::{
     net::{TcpListener, TcpStream},
+    time::sleep,
     try_join,
 };
 
@@ -99,9 +101,25 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                     if let Ok(conn) = hyper::upgrade::on(&mut req).await {
                                         trace!("Tunnel opened");
 
-                                        if let Ok((client, h2)) = h2::client::handshake(conn).await
+                                        if let Ok((client, mut h2)) =
+                                            h2::client::handshake(conn).await
                                         {
                                             tun_entry.add_tunnel(client.into()).await;
+
+                                            let mut ping_pong = h2.ping_pong().unwrap();
+                                            tokio::spawn(
+                                                #[allow(unreachable_code)]
+                                                async move {
+                                                    loop {
+                                                        sleep(Duration::from_secs(10)).await;
+                                                        trace!("Sending ping");
+                                                        ping_pong.ping(h2::Ping::opaque()).await?;
+                                                        trace!("Received pong");
+                                                    }
+                                                    Ok::<_, Box<dyn Error + Send + Sync>>(())
+                                                }
+                                                .in_current_span(),
+                                            );
 
                                             if let Err(err) = h2.await {
                                                 debug!(error = %err, "Error");

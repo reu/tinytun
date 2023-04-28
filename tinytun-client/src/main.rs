@@ -17,12 +17,12 @@ struct Args {
     #[arg(short, long)]
     port: u16,
 
-    /// Connection management port
-    #[arg(long, default_value_t = Uri::from_static("http://local.tinytun.com:5554"))]
+    /// Connection management server URL
+    #[arg(long, default_value_t = default_api_url())]
     server_url: Uri,
 
     /// Proxy URL
-    #[arg(long, default_value_t = Uri::from_static("http://local.tinytun.com:5555"))]
+    #[arg(long, default_value_t = default_proxy_url())]
     proxy_url: Uri,
 
     /// Subdomain to use
@@ -32,6 +32,16 @@ struct Args {
     /// Maximum number of local connections allowed to keep open
     #[arg(long, default_value_t = 4)]
     pool_size: usize,
+}
+
+fn default_api_url() -> Uri {
+    let default = option_env!("TINYTUN_DEFAULT_SERVER_URL");
+    Uri::from_static(default.unwrap_or("http://local.tinytun.com:5554"))
+}
+
+fn default_proxy_url() -> Uri {
+    let default = option_env!("TINYTUN_DEFAULT_PROXY_URL");
+    Uri::from_static(default.unwrap_or("http://local.tinytun.com:5555"))
 }
 
 #[tokio::main]

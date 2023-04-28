@@ -172,9 +172,7 @@ impl Drop for TunnelEntry {
         if !self.persisted {
             let subdomain = self.subdomain.clone();
             let tunnels = self.registry.clone();
-            tokio::spawn(async move {
-                tunnels.subdomains.remove(&subdomain);
-            });
+            tunnels.subdomains.remove(&subdomain);
         }
     }
 }

@@ -29,9 +29,9 @@ struct Args {
     #[arg(short, long)]
     subdomain: Option<String>,
 
-    /// Maximum number of local connections allowed to keep open
-    #[arg(long, default_value_t = 4)]
-    pool_size: usize,
+    /// Maximum number of concurrent connections allowed
+    #[arg(short, long, default_value_t = 100)]
+    concurrency: u32,
 }
 
 fn default_api_url() -> Uri {
@@ -98,7 +98,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     println!("Forwarding via: {proxy_url}");
 
     let remote = upgrade::on(res).await?;
-    let mut connection = h2::server::handshake(remote).await?;
+    let mut connection = h2::server::Builder::new()
+        .max_concurrent_streams(args.concurrency)
+        .handshake(remote)
+        .await?;
     while let Some(result) = connection.accept().await {
         let (remote_req, mut remote_respond) = result?;
 

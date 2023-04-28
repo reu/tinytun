@@ -1,0 +1,53 @@
+app = "tinytun"
+primary_region = "gru"
+kill_signal = "SIGINT"
+kill_timeout = "5s"
+
+[env]
+  PRIMARY_REGION = "gru"
+  RUST_LOG = "tinytun_server=info"
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 5554
+  auto_stop_machines = false
+  auto_start_machines = false
+
+  [[services.ports]]
+    port = 5554
+    handlers = ["tls"]
+
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 20000
+    soft_limit = 10000
+
+  [[services.http_checks]]
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "1s"
+    restart_limit = 0
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 5555
+  auto_stop_machines = false
+  auto_start_machines = false
+
+  [[services.ports]]
+    port = 80
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls"]
+
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 20000
+    soft_limit = 10000
+
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "1s"
+    restart_limit = 0

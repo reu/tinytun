@@ -128,8 +128,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 Ok::<_, Box<dyn Error + Send + Sync>>(())
             };
 
-            if let Err(err) = try_join!(read, write) {
-                eprintln!("Error: {err}");
+            let (write, read) = try_join!(tokio::spawn(write), tokio::spawn(read))?;
+
+            match (write, read) {
+                (Err(err), _) | (_, Err(err)) => {
+                    eprintln!("Error: {err}");
+                }
+                _ => {}
             }
 
             Ok::<_, Box<dyn Error + Send + Sync>>(())

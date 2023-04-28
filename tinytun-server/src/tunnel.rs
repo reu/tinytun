@@ -8,7 +8,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
-use tracing::{trace, instrument};
+use tracing::{instrument, trace};
 
 #[derive(Debug, Clone)]
 pub struct Tunnel {
@@ -62,7 +62,9 @@ impl Tunnel {
             Ok::<_, Box<dyn Error + Send + Sync>>(())
         };
 
-        tokio::try_join!(write, read)?;
+        let (write, read) = tokio::try_join!(tokio::spawn(write), tokio::spawn(read))?;
+        write?;
+        read?;
 
         Ok(())
     }

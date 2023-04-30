@@ -1,9 +1,17 @@
-use std::{error::Error, fmt::Display, sync::Arc};
+use std::{
+    error::Error,
+    fmt::Display,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use hyper::Request;
 use rand::{thread_rng, Rng};
+use serde::{Serialize, Serializer};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -13,12 +21,16 @@ use tracing::{instrument, trace};
 #[derive(Debug, Clone)]
 pub struct Tunnel {
     client: h2::client::SendRequest<Bytes>,
+    read_bytes: Arc<AtomicUsize>,
+    written_bytes: Arc<AtomicUsize>,
 }
 
 impl Tunnel {
     #[instrument(skip(self, stream))]
     pub async fn tunnel(&self, stream: TcpStream) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut sender = self.client.clone().ready().await?;
+        let read_bytes = self.read_bytes.clone();
+        let written_bytes = self.written_bytes.clone();
 
         let (res, mut send_stream) = sender.send_request(Request::new(()), false)?;
 
@@ -37,6 +49,7 @@ impl Tunnel {
                         trace!(bytes = n, "Writing");
                         let buf = BytesMut::from(&buf[0..n]);
                         send_stream.send_data(buf.into(), false)?;
+                        written_bytes.fetch_add(n, Ordering::Relaxed);
                     }
                 }
             }
@@ -54,9 +67,11 @@ impl Tunnel {
                 if chunk.is_empty() {
                     break;
                 }
-                trace!(bytes = chunk.len(), "Reading");
-                flow_control.release_capacity(chunk.len())?;
+                let len = chunk.len();
+                trace!(bytes = len, "Reading");
+                flow_control.release_capacity(len)?;
                 writer.write_all(&chunk).await?;
+                read_bytes.fetch_add(len, Ordering::Relaxed);
             }
             trace!("Finishing reading");
             Ok::<_, Box<dyn Error + Send + Sync>>(())
@@ -74,6 +89,8 @@ impl From<h2::client::SendRequest<Bytes>> for Tunnel {
     fn from(send_request: h2::client::SendRequest<Bytes>) -> Self {
         Tunnel {
             client: send_request,
+            read_bytes: Default::default(),
+            written_bytes: Default::default(),
         }
     }
 }
@@ -94,6 +111,12 @@ impl Display for TunnelId {
             write!(f, "{byte:02x}")?;
         }
         Ok(())
+    }
+}
+
+impl Serialize for TunnelId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
     }
 }
 
@@ -141,6 +164,26 @@ impl Tunnels {
             self.subdomains.remove(&subdomain);
         }
     }
+
+    pub async fn list_tunnels_metadata(&self) -> impl Iterator<Item = TunnelMetadata> + '_ {
+        self.tunnels.iter().map(|item| {
+            let (tunnel, subdomain) = item.value();
+            TunnelMetadata {
+                id: *item.key(),
+                subdomain: subdomain.clone(),
+                read_bytes: tunnel.read_bytes.load(Ordering::Relaxed),
+                written_bytes: tunnel.written_bytes.load(Ordering::Relaxed),
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TunnelMetadata {
+    pub id: TunnelId,
+    pub subdomain: String,
+    pub read_bytes: usize,
+    pub written_bytes: usize,
 }
 
 pub struct TunnelEntry {

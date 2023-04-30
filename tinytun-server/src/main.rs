@@ -32,6 +32,10 @@ struct Args {
     #[arg(short, long, default_value_t = 5555)]
     proxy_port: u16,
 
+    /// Metadata port
+    #[arg(short, long, default_value_t = 5553)]
+    metadata_port: u16,
+
     /// Connection management port
     #[arg(short, long, default_value_t = 5554)]
     conn_port: u16,
@@ -143,6 +147,44 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     };
 
+    let metadata_api = async {
+        let tuns = tuns.clone();
+        let addr = SocketAddr::from(([0, 0, 0, 0], args.metadata_port));
+        let listener = TcpListener::bind(&addr).await?;
+        info!("Metadata api running on port {}", args.metadata_port);
+
+        Server::builder(AddrIncoming::from_listener(listener)?)
+            .serve(make_service_fn(move |_| {
+                let tuns = tuns.clone();
+
+                async move {
+                    Ok::<_, Box<dyn Error + Send + Sync>>(service_fn(move |req| {
+                        let tuns = tuns.clone();
+                        async move {
+                            match req.uri().path().split('/').collect::<Vec<_>>().as_slice() {
+                                ["", "tunnels"] => {
+                                    let tunnels =
+                                        tuns.list_tunnels_metadata().await.collect::<Vec<_>>();
+
+                                    let tunnels = serde_json::to_vec(&tunnels).unwrap();
+
+                                    Response::builder()
+                                        .status(StatusCode::OK)
+                                        .body(Body::from(tunnels))
+                                }
+
+                                _ => Response::builder()
+                                    .status(StatusCode::NOT_FOUND)
+                                    .body(Body::empty()),
+                            }
+                        }
+                    }))
+                }
+            }))
+            .await?;
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    };
+
     let tcp_proxy = async {
         let tuns = tuns.clone();
         let addr = SocketAddr::from(([0, 0, 0, 0], args.proxy_port));
@@ -196,7 +238,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     };
 
-    try_join!(api, tcp_proxy)?;
+    try_join!(api, tcp_proxy, metadata_api)?;
 
     Ok(())
 }

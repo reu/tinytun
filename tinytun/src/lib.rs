@@ -32,11 +32,7 @@ impl Tunnel {
         match self.connection.accept().await {
             Some(Ok((req, mut respond))) => {
                 let sender = respond.send_response(Response::new(()), false).ok()?;
-                Some(TunnelStream {
-                    receiver: req.into_body(),
-                    sender,
-                    buf: Bytes::new(),
-                })
+                Some(TunnelStream::new(req.into_body(), sender))
             }
             _ => None,
         }
@@ -157,6 +153,16 @@ pub struct TunnelStream {
     receiver: RecvStream,
     sender: SendStream<Bytes>,
     buf: Bytes,
+}
+
+impl TunnelStream {
+    pub fn new(receiver: RecvStream, sender: SendStream<Bytes>) -> Self {
+        Self {
+            sender,
+            receiver,
+            buf: Bytes::new(),
+        }
+    }
 }
 
 impl AsyncRead for TunnelStream {

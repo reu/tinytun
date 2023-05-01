@@ -1,22 +1,26 @@
 use std::{
     error::Error,
     fmt::Display,
+    pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    task::{self, ready},
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use dashmap::DashMap;
 use hyper::Request;
+use pin_project::pin_project;
 use rand::{thread_rng, Rng};
 use serde::{Serialize, Serializer};
+use tinytun::TunnelStream;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{self, AsyncRead, AsyncWrite},
     net::TcpStream,
 };
-use tracing::{instrument, trace};
+use tracing::instrument;
 
 #[derive(Debug, Clone)]
 pub struct Tunnel {
@@ -27,58 +31,17 @@ pub struct Tunnel {
 
 impl Tunnel {
     #[instrument(skip(self, stream))]
-    pub async fn tunnel(&self, stream: TcpStream) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let mut sender = self.client.clone().ready().await?;
-        let read_bytes = self.read_bytes.clone();
-        let written_bytes = self.written_bytes.clone();
-
-        let (res, mut send_stream) = sender.send_request(Request::new(()), false)?;
-
-        let (mut reader, mut writer) = stream.into_split();
-
-        let write = async move {
-            loop {
-                let mut buf = vec![0; 8 * 1024];
-                match reader.read(&mut buf).await? {
-                    0 => {
-                        trace!("Finishing writing");
-                        send_stream.send_data(Bytes::default(), true).unwrap();
-                        break;
-                    }
-                    n => {
-                        trace!(bytes = n, "Writing");
-                        let buf = BytesMut::from(&buf[0..n]);
-                        send_stream.send_data(buf.into(), false)?;
-                        written_bytes.fetch_add(n, Ordering::Relaxed);
-                    }
-                }
-            }
-            Ok::<_, Box<dyn Error + Send + Sync>>(())
+    pub async fn tunnel(&self, mut stream: TcpStream) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut client = self.client.clone().ready().await?;
+        let (res, send_stream) = client.send_request(Request::new(()), false)?;
+        let res = res.await?;
+        let tunnel_stream = TunnelStream::new(res.into_body(), send_stream);
+        let mut tunnel_stream = StreamMonitor {
+            inner: tunnel_stream,
+            read_bytes: self.read_bytes.clone(),
+            written_bytes: self.written_bytes.clone(),
         };
-
-        let read = async move {
-            trace!("Sending request");
-            let res = res.await?;
-            trace!(status = %res.status(), "Upstream response");
-            let mut body = res.into_body();
-            let mut flow_control = body.flow_control().clone();
-            while let Some(chunk) = body.data().await {
-                let chunk = chunk?;
-                if chunk.is_empty() {
-                    break;
-                }
-                let len = chunk.len();
-                trace!(bytes = len, "Reading");
-                flow_control.release_capacity(len)?;
-                writer.write_all(&chunk).await?;
-                read_bytes.fetch_add(len, Ordering::Relaxed);
-            }
-            trace!("Finishing reading");
-            Ok::<_, Box<dyn Error + Send + Sync>>(())
-        };
-
-        tokio::try_join!(write, read)?;
-
+        io::copy_bidirectional(&mut stream, &mut tunnel_stream).await?;
         Ok(())
     }
 }
@@ -215,5 +178,52 @@ impl Drop for TunnelEntry {
             let tunnels = self.registry.clone();
             tunnels.subdomains.remove(&subdomain);
         }
+    }
+}
+
+#[pin_project]
+struct StreamMonitor<T> {
+    #[pin]
+    inner: T,
+    read_bytes: Arc<AtomicUsize>,
+    written_bytes: Arc<AtomicUsize>,
+}
+
+impl<T: AsyncRead> AsyncRead for StreamMonitor<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &mut io::ReadBuf<'_>,
+    ) -> task::Poll<io::Result<()>> {
+        let this = self.project();
+        let remaining = buf.remaining();
+        let result = this.inner.poll_read(cx, buf);
+        let read = remaining - buf.remaining();
+        this.read_bytes.fetch_add(read, Ordering::Relaxed);
+        result
+    }
+}
+
+impl<T: AsyncWrite> AsyncWrite for StreamMonitor<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &[u8],
+    ) -> task::Poll<io::Result<usize>> {
+        let this = self.project();
+        let written = ready!(this.inner.poll_write(cx, buf))?;
+        this.written_bytes.fetch_add(written, Ordering::Relaxed);
+        task::Poll::Ready(Ok(written))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<io::Result<()>> {
+        self.project().inner.poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> task::Poll<io::Result<()>> {
+        self.project().inner.poll_shutdown(cx)
     }
 }

@@ -1,7 +1,8 @@
 use std::{
     error::Error,
     fmt::Display,
-    pin::Pin,
+    net::{SocketAddr, ToSocketAddrs},
+    pin::{pin, Pin},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -11,7 +12,8 @@ use std::{
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use hyper::Request;
+use futures::{stream, StreamExt};
+use hyper::{Request, Uri};
 use pin_project::pin_project;
 use rand::{thread_rng, Rng};
 use serde::{Serialize, Serializer};
@@ -20,28 +22,43 @@ use tokio::{
     io::{self, AsyncRead, AsyncWrite},
     net::TcpStream,
 };
-use tracing::instrument;
+use tracing::{instrument, trace};
 
 #[derive(Debug, Clone)]
 pub struct Tunnel {
-    client: h2::client::SendRequest<Bytes>,
+    connection: TunnelConnection,
     read_bytes: Arc<AtomicUsize>,
     written_bytes: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Clone)]
+enum TunnelConnection {
+    Local(h2::client::SendRequest<Bytes>),
+    Remote(SocketAddr),
 }
 
 impl Tunnel {
     #[instrument(skip(self, stream))]
     pub async fn tunnel(&self, mut stream: TcpStream) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let mut client = self.client.clone().ready().await?;
-        let (res, send_stream) = client.send_request(Request::new(()), false)?;
-        let res = res.await?;
-        let tunnel_stream = TunnelStream::new(res.into_body(), send_stream);
-        let mut tunnel_stream = StreamMonitor {
-            inner: tunnel_stream,
-            read_bytes: self.read_bytes.clone(),
-            written_bytes: self.written_bytes.clone(),
+        match self.connection {
+            TunnelConnection::Local(ref client) => {
+                let mut client = client.clone().ready().await?;
+                let (res, send_stream) = client.send_request(Request::new(()), false)?;
+                let res = res.await?;
+                let tunnel_stream = TunnelStream::new(res.into_body(), send_stream);
+                let mut tunnel_stream = StreamMonitor {
+                    inner: tunnel_stream,
+                    read_bytes: self.read_bytes.clone(),
+                    written_bytes: self.written_bytes.clone(),
+                };
+                io::copy_bidirectional(&mut stream, &mut tunnel_stream).await?;
+            }
+
+            TunnelConnection::Remote(addr) => {
+                let mut remote_stream = TcpStream::connect(addr).await?;
+                io::copy_bidirectional(&mut stream, &mut remote_stream).await?;
+            }
         };
-        io::copy_bidirectional(&mut stream, &mut tunnel_stream).await?;
         Ok(())
     }
 }
@@ -49,7 +66,17 @@ impl Tunnel {
 impl From<h2::client::SendRequest<Bytes>> for Tunnel {
     fn from(send_request: h2::client::SendRequest<Bytes>) -> Self {
         Tunnel {
-            client: send_request,
+            connection: TunnelConnection::Local(send_request),
+            read_bytes: Default::default(),
+            written_bytes: Default::default(),
+        }
+    }
+}
+
+impl From<SocketAddr> for Tunnel {
+    fn from(addr: SocketAddr) -> Self {
+        Tunnel {
+            connection: TunnelConnection::Remote(addr),
             read_bytes: Default::default(),
             written_bytes: Default::default(),
         }
@@ -116,8 +143,48 @@ impl Tunnels {
     }
 
     pub async fn tunnel_for_subdomain(&self, subdomain: &str) -> Option<Tunnel> {
-        let tun_id = self.subdomains.get(subdomain)?;
-        self.tunnels.get(&tun_id).map(|tun| tun.value().0.clone())
+        if let Some(tunnel) = self
+            .subdomains
+            .get(subdomain)
+            .and_then(|tun_id| self.tunnels.get(&tun_id).map(|tun| tun.value().0.clone()))
+        {
+            trace!("Found?");
+            return Some(tunnel);
+        }
+
+        let servers = stream::iter(vec![
+            SocketAddr::from(([127, 0, 0, 1], 15555)),
+            SocketAddr::from(([127, 0, 0, 1], 15556)),
+            // SocketAddr::from(([127, 0, 0, 1], 15557)),
+        ]);
+
+        let http = hyper::Client::new();
+        let hosts = servers
+            .filter_map(|addr| {
+                let http = http.clone();
+                async move {
+                    trace!("Querying {addr} for {subdomain}");
+                    match http
+                        .get(Uri::try_from(format!("http://{addr}/tunnels/{subdomain}")).unwrap())
+                        .await
+                    {
+                        Ok(res) if res.status().is_success() => {
+                            let bytes = hyper::body::to_bytes(res.into_body()).await.ok()?;
+                            let body: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+                            Some(body.as_object()?.get("address")?.as_str()?.to_owned())
+                        }
+                        _ => None,
+                    }
+                }
+            })
+            .filter_map(|addr| async move { addr.to_socket_addrs().ok()?.into_iter().next() });
+
+        if let Some(host) = pin!(hosts).next().await {
+            trace!("Remote tunnel {host}");
+            return Some(Tunnel::from(host));
+        }
+
+        None
     }
 
     pub async fn remove_tunnel(&self, tun_id: TunnelId) {

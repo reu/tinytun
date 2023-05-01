@@ -13,6 +13,7 @@ use hyper::{
     service::{make_service_fn, service_fn},
     Body, Method, Response, Server, StatusCode,
 };
+use serde_json::json;
 use tokio::{
     net::{TcpListener, TcpStream},
     time::sleep,
@@ -163,6 +164,24 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         let tuns = tuns.clone();
                         async move {
                             match req.uri().path().split('/').collect::<Vec<_>>().as_slice() {
+                                ["", "tunnels", subdomain] => {
+                                    match tuns
+                                        .list_tunnels_metadata()
+                                        .await
+                                        .find(|tun| &tun.subdomain == subdomain)
+                                    {
+                                        Some(tun) => Response::builder()
+                                            .status(StatusCode::OK)
+                                            .body(Body::from(serde_json::to_vec(&json!({
+                                                "tunnel": tun,
+                                                "address": format!("{}.local.tinytun.com:{}", tun.subdomain, args.proxy_port),
+                                            })).unwrap())),
+                                        None => Response::builder()
+                                            .status(StatusCode::NOT_FOUND)
+                                            .body(Body::empty()),
+                                    }
+                                }
+
                                 ["", "tunnels"] => {
                                     let tunnels =
                                         tuns.list_tunnels_metadata().await.collect::<Vec<_>>();

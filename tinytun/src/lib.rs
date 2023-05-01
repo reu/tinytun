@@ -98,7 +98,7 @@ impl TunnelBuilder {
         }
     }
 
-    pub async fn connect(self) -> Result<Tunnel, Box<dyn Error + Send + Sync>> {
+    pub async fn listen(self) -> Result<Tunnel, Box<dyn Error + Send + Sync>> {
         let res = Client::builder()
             .build(
                 HttpsConnectorBuilder::new()

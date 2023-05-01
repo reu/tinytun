@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .base_url(args.proxy_url)
         .subdomain(args.subdomain)
         .max_concurrent_streams(args.concurrency)
-        .connect()
+        .listen()
         .await?;
 
     println!("Forwarding via: {}", tun.proxy_url());

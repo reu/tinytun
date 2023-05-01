@@ -1,0 +1,18 @@
+[package]
+name = "tinytun"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+authors = ["Rodrigo Navarro <rnavarro@rnavarro.com.br>"]
+description = "Expose local web servers on the internet"
+categories = ["network-programming", "asynchronous"]
+keywords = ["web", "tunnel", "proxy"]
+documentation = "https://docs.rs/tinytun"
+repository = "https://github.com/reu/tinytun"
+
+[dependencies]
+bytes = "1.4.0"
+h2 = "0.3.18"
+hyper = { version = "0.14.23", features = ["client", "http1"] }
+hyper-rustls = { version = "0.24.0", features = ["http1"] }
+tokio = { version = "1.25.0", features = ["io-std", "net"] }

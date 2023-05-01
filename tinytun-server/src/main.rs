@@ -111,21 +111,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                             tun_entry.add_tunnel(client.into()).await;
 
                                             let mut ping_pong = h2.ping_pong().unwrap();
-                                            tokio::spawn(
-                                                #[allow(unreachable_code)]
-                                                async move {
-                                                    loop {
-                                                        sleep(Duration::from_secs(10)).await;
-                                                        trace!("Sending ping");
-                                                        ping_pong.ping(h2::Ping::opaque()).await?;
-                                                        trace!("Received pong");
-                                                    }
-                                                    Ok::<_, Box<dyn Error + Send + Sync>>(())
+                                            #[allow(unreachable_code)]
+                                            let ping = async move {
+                                                loop {
+                                                    sleep(Duration::from_secs(10)).await;
+                                                    trace!("Sending ping");
+                                                    ping_pong.ping(h2::Ping::opaque()).await?;
+                                                    trace!("Received pong");
                                                 }
-                                                .in_current_span(),
-                                            );
+                                                Ok(h2::Error::from(h2::Reason::STREAM_CLOSED))
+                                            }
+                                            .in_current_span();
 
-                                            if let Err(err) = h2.await {
+                                            if let Err(err) = try_join!(h2, ping) {
                                                 debug!(error = %err, "Error");
                                             }
                                         }

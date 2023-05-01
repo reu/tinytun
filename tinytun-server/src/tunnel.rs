@@ -77,9 +77,7 @@ impl Tunnel {
             Ok::<_, Box<dyn Error + Send + Sync>>(())
         };
 
-        let (write, read) = tokio::try_join!(tokio::spawn(write), tokio::spawn(read))?;
-        write?;
-        read?;
+        tokio::try_join!(write, read)?;
 
         Ok(())
     }

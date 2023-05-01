@@ -119,11 +119,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                                     ping_pong.ping(h2::Ping::opaque()).await?;
                                                     trace!("Received pong");
                                                 }
-                                                Ok(h2::Error::from(h2::Reason::STREAM_CLOSED))
+                                                Ok::<_, h2::Error>(())
                                             }
                                             .in_current_span();
 
-                                            if let Err(err) = try_join!(h2, ping) {
+                                            if let Err(err) = tokio::select! {
+                                                result = h2 => result,
+                                                result = ping => result,
+                                            } {
                                                 debug!(error = %err, "Error");
                                             }
                                         }

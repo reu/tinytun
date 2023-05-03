@@ -132,7 +132,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                         trace!("Tunnel closed");
                                     }
                                 }
-                                .instrument(tracing::trace_span!("Tunnel", %subdomain)),
+                                .instrument(tracing::error_span!("Tunnel", %subdomain)),
                             );
 
                             Ok(res)
@@ -214,7 +214,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 match tuns.tunnel_for_subdomain(subdomain).await {
                     Some(tun) => {
                         tun.tunnel(stream)
-                            .instrument(tracing::trace_span!("Tunneling", subdomain))
+                            .instrument(tracing::error_span!("Tunneling", subdomain))
                             .await?;
                     }
                     None => {

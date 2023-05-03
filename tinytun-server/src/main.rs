@@ -1,4 +1,5 @@
 use std::{
+    env,
     error::Error,
     io::{BufRead, Cursor},
     net::SocketAddr,
@@ -6,7 +7,6 @@ use std::{
     time::Duration,
 };
 
-use clap::Parser;
 use hyper::{
     header,
     server::conn::{AddrIncoming, Http as HttpServer},
@@ -25,22 +25,6 @@ use tunnel::Tunnels;
 
 mod tunnel;
 
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Proxy port
-    #[arg(short, long, default_value_t = 5555)]
-    proxy_port: u16,
-
-    /// Metadata port
-    #[arg(short, long, default_value_t = 5553)]
-    metadata_port: u16,
-
-    /// Connection management port
-    #[arg(short, long, default_value_t = 5554)]
-    conn_port: u16,
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     tracing_subscriber::registry()
@@ -52,16 +36,29 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         )
         .init();
 
-    let args = Args::parse();
+    let metadata_port = env::var("METADATA_PORT")
+        .ok()
+        .and_then(|port| port.parse::<u16>().ok())
+        .unwrap_or(5553);
+
+    let conn_port = env::var("CONNECTION_PORT")
+        .ok()
+        .and_then(|port| port.parse::<u16>().ok())
+        .unwrap_or(5554);
+
+    let proxy_port = env::var("PROXY_PORT")
+        .ok()
+        .and_then(|port| port.parse::<u16>().ok())
+        .unwrap_or(5555);
 
     let tuns = Arc::new(Tunnels::new());
 
     let api = async {
         let tuns = tuns.clone();
 
-        let addr = SocketAddr::from(([0, 0, 0, 0], args.conn_port));
+        let addr = SocketAddr::from(([0, 0, 0, 0], conn_port));
         let listener = TcpListener::bind(&addr).await?;
-        info!("API running on port {}", args.conn_port);
+        info!("API running on port {}", conn_port);
 
         Server::builder(AddrIncoming::from_listener(listener)?)
             .serve(make_service_fn(move |_| {
@@ -150,9 +147,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let metadata_api = async {
         let tuns = tuns.clone();
-        let addr = SocketAddr::from(([0, 0, 0, 0], args.metadata_port));
+        let addr = SocketAddr::from(([0, 0, 0, 0], metadata_port));
         let listener = TcpListener::bind(&addr).await?;
-        info!("Metadata api running on port {}", args.metadata_port);
+        info!("Metadata api running on port {}", metadata_port);
 
         Server::builder(AddrIncoming::from_listener(listener)?)
             .serve(make_service_fn(move |_| {
@@ -188,9 +185,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let tcp_proxy = async {
         let tuns = tuns.clone();
-        let addr = SocketAddr::from(([0, 0, 0, 0], args.proxy_port));
+        let addr = SocketAddr::from(([0, 0, 0, 0], proxy_port));
         let listener = TcpListener::bind(&addr).await?;
-        info!("Proxy running on port {}", args.proxy_port);
+        info!("Proxy running on port {}", proxy_port);
 
         while let Ok((stream, _addr)) = listener.accept().await {
             let tuns = tuns.clone();

@@ -12,7 +12,7 @@ use std::{
 use bytes::Bytes;
 use dashmap::DashMap;
 use hyper::Request;
-use pin_project::pin_project;
+use pin_project_lite::pin_project;
 use rand::{thread_rng, Rng};
 use serde::{Serialize, Serializer};
 use tinytun::TunnelStream;
@@ -181,12 +181,13 @@ impl Drop for TunnelEntry {
     }
 }
 
-#[pin_project]
-struct StreamMonitor<T> {
-    #[pin]
-    inner: T,
-    read_bytes: Arc<AtomicUsize>,
-    written_bytes: Arc<AtomicUsize>,
+pin_project! {
+    struct StreamMonitor<T> {
+        #[pin]
+        inner: T,
+        read_bytes: Arc<AtomicUsize>,
+        written_bytes: Arc<AtomicUsize>,
+    }
 }
 
 impl<T: AsyncRead> AsyncRead for StreamMonitor<T> {

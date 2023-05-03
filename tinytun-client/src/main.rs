@@ -1,4 +1,4 @@
-use std::error::Error;
+use std::{env, error::Error};
 
 use clap::Parser;
 use http::Uri;
@@ -12,19 +12,11 @@ struct Args {
     #[arg(short, long)]
     port: u16,
 
-    /// Connection management server URL
-    #[arg(long, default_value_t = default_api_url())]
-    server_url: Uri,
-
-    /// Proxy URL
-    #[arg(long, default_value_t = default_proxy_url())]
-    proxy_url: Uri,
-
     /// Subdomain to use
     #[arg(short, long)]
     subdomain: Option<String>,
 
-    /// Maximum number of concurrent connections allowed
+    /// Maximum number of concurrent connections allowed on the local service
     #[arg(short, long, default_value_t = 100)]
     concurrency: u32,
 }
@@ -43,9 +35,19 @@ fn default_proxy_url() -> Uri {
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args::parse();
 
+    let server_url = env::var("TINYTUN_SERVER_URL")
+        .ok()
+        .and_then(|url| url.parse::<Uri>().ok())
+        .unwrap_or(default_api_url());
+
+    let proxy_url = env::var("TINYTUN_PROXY_URL")
+        .ok()
+        .and_then(|url| url.parse::<Uri>().ok())
+        .unwrap_or(default_proxy_url());
+
     let mut tun = Tunnel::builder()
-        .server_url(args.server_url)
-        .base_url(args.proxy_url)
+        .server_url(server_url)
+        .base_url(proxy_url)
         .subdomain(args.subdomain)
         .max_concurrent_streams(args.concurrency)
         .listen()

@@ -8,8 +8,7 @@ use tokio::{io, net::TcpStream};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Service port
-    #[arg(short, long)]
+    /// Local web service port
     port: u16,
 
     /// Subdomain to use

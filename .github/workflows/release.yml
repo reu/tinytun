@@ -40,7 +40,6 @@ jobs:
     needs: release
     env:
       TINYTUN_DEFAULT_SERVER_URL: https://tinytun.com:5554
-      TINYTUN_DEFAULT_PROXY_URL: https://tinytun.com
     strategy:
       fail-fast: false
       matrix:
@@ -92,7 +91,6 @@ jobs:
     needs: release
     env:
       TINYTUN_DEFAULT_SERVER_URL: https://tinytun.com:5554
-      TINYTUN_DEFAULT_PROXY_URL: https://tinytun.com
     strategy:
       fail-fast: false
       matrix:

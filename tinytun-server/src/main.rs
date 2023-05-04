@@ -51,6 +51,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .and_then(|port| port.parse::<u16>().ok())
         .unwrap_or(5555);
 
+    let base_domain = env::var("BASE_DOMAIN").ok().unwrap_or_else(|| {
+        option_env!("DEFAULT_BASE_DOMAIN")
+            .unwrap_or("local.tinytun.com")
+            .to_string()
+    });
+    let base_domain = Arc::new(base_domain);
+
     let tuns = Arc::new(Tunnels::new());
 
     let api = async {
@@ -62,10 +69,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
         Server::builder(AddrIncoming::from_listener(listener)?)
             .serve(make_service_fn(move |_| {
+                let base_domain = base_domain.clone();
                 let tuns = tuns.clone();
                 async {
                     Ok::<_, Box<dyn Error + Send + Sync>>(service_fn(move |mut req| {
                         let tuns = tuns.clone();
+                        let base_domain = base_domain.clone();
+
                         async move {
                             if req.method() != Method::CONNECT {
                                 return Response::builder()
@@ -94,6 +104,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                             let res = Response::builder()
                                 .status(StatusCode::SWITCHING_PROTOCOLS)
                                 .header("x-tinytun-connection-id", tun_id.to_string())
+                                .header("x-tinytun-domain", format!("{subdomain}.{base_domain}"))
                                 .header("x-tinytun-subdomain", &subdomain)
                                 .body(Body::empty())?;
 

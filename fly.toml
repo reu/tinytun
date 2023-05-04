@@ -6,6 +6,7 @@ kill_timeout = "5s"
 [env]
   PRIMARY_REGION = "gru"
   RUST_LOG = "tinytun_server=info"
+  BASE_DOMAIN = "tinytun.com"
 
 [[services]]
   protocol = "tcp"

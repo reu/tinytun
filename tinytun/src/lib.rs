@@ -41,7 +41,6 @@ impl Tunnel {
 
 pub struct TunnelBuilder {
     server_url: Result<Uri, Box<dyn Error + Send + Sync>>,
-    base_url: Result<Uri, Box<dyn Error + Send + Sync>>,
     subdomain: Option<String>,
     max_concurrent_streams: u32,
 }
@@ -49,8 +48,7 @@ pub struct TunnelBuilder {
 impl Default for TunnelBuilder {
     fn default() -> Self {
         Self {
-            server_url: Ok(Uri::from_static("https://control.tinytun.com:5555")),
-            base_url: Ok(Uri::from_static("https://tinytun.com")),
+            server_url: Ok(Uri::from_static("https://tinytun.com:5555")),
             max_concurrent_streams: 100,
             subdomain: Default::default(),
         }
@@ -73,17 +71,6 @@ impl TunnelBuilder {
         }
     }
 
-    pub fn base_url<T>(self, base_url: T) -> Self
-    where
-        Uri: TryFrom<T>,
-        <Uri as TryFrom<T>>::Error: Into<Box<dyn Error + Send + Sync>>,
-    {
-        Self {
-            base_url: base_url.try_into().map_err(Into::into),
-            ..self
-        }
-    }
-
     pub fn subdomain(self, subdomain: impl Into<Option<String>>) -> Self {
         Self {
             subdomain: subdomain.into(),
@@ -99,6 +86,7 @@ impl TunnelBuilder {
     }
 
     pub async fn listen(self) -> Result<Tunnel, Box<dyn Error + Send + Sync>> {
+        let server_url = self.server_url?;
         let res = Client::builder()
             .build(
                 HttpsConnectorBuilder::new()
@@ -108,9 +96,7 @@ impl TunnelBuilder {
                     .build(),
             )
             .request({
-                let req = Request::builder()
-                    .uri(self.server_url?)
-                    .method(Method::CONNECT);
+                let req = Request::builder().uri(&server_url).method(Method::CONNECT);
 
                 match self.subdomain {
                     Some(subdomain) if !subdomain.trim().is_empty() => req
@@ -121,20 +107,23 @@ impl TunnelBuilder {
             })
             .await?;
 
-        let conn_id = res
+        let domain = res
             .headers()
-            .get("x-tinytun-subdomain")
+            .get("x-tinytun-domain")
             .ok_or("Server didn't provide a connection id")?
             .to_str()?;
 
-        let proxy_url = Uri::from_parts({
-            let mut proxy_url = self.base_url?.into_parts();
-            proxy_url.authority = {
-                let authority = format!("{conn_id}.{}", proxy_url.authority.unwrap());
-                Some(authority.parse()?)
-            };
-            proxy_url
-        })?;
+        let proxy_url = Uri::builder()
+            .scheme(
+                server_url
+                    .scheme()
+                    .map(|scheme| scheme.to_string())
+                    .unwrap_or("http".to_string())
+                    .as_str(),
+            )
+            .authority(domain)
+            .path_and_query("")
+            .build()?;
 
         let remote = upgrade::on(res).await?;
         let connection = h2::server::Builder::new()

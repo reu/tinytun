@@ -21,16 +21,6 @@ struct Args {
     concurrency: u32,
 }
 
-fn default_api_url() -> Uri {
-    let default = option_env!("TINYTUN_DEFAULT_SERVER_URL");
-    Uri::from_static(default.unwrap_or("http://local.tinytun.com:5554"))
-}
-
-fn default_proxy_url() -> Uri {
-    let default = option_env!("TINYTUN_DEFAULT_PROXY_URL");
-    Uri::from_static(default.unwrap_or("http://local.tinytun.com:5555"))
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args::parse();
@@ -38,16 +28,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let server_url = env::var("TINYTUN_SERVER_URL")
         .ok()
         .and_then(|url| url.parse::<Uri>().ok())
-        .unwrap_or(default_api_url());
-
-    let proxy_url = env::var("TINYTUN_PROXY_URL")
-        .ok()
-        .and_then(|url| url.parse::<Uri>().ok())
-        .unwrap_or(default_proxy_url());
+        .unwrap_or_else(|| {
+            let default = option_env!("TINYTUN_DEFAULT_SERVER_URL");
+            Uri::from_static(default.unwrap_or("http://local.tinytun.com:5554"))
+        });
 
     let mut tun = Tunnel::builder()
         .server_url(server_url)
-        .base_url(proxy_url)
         .subdomain(args.subdomain)
         .max_concurrent_streams(args.concurrency)
         .listen()

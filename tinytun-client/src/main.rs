@@ -1,9 +1,9 @@
-use std::{env, error::Error};
+use std::{env, error::Error, time::Duration};
 
 use clap::Parser;
 use http::Uri;
 use tinytun::Tunnel;
-use tokio::{io, net::TcpStream};
+use tokio::{io, net::TcpStream, select, signal, time::sleep};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -32,29 +32,70 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             Uri::from_static(default.unwrap_or("http://local.tinytun.com:5554"))
         });
 
-    let mut tun = Tunnel::builder()
-        .server_url(server_url)
-        .subdomain(args.subdomain)
-        .max_concurrent_streams(args.concurrency)
-        .listen()
-        .await?;
+    let interrupt = signal::ctrl_c();
 
-    println!("Forwarding via: {}", tun.proxy_url());
+    let proxy = async move {
+        let mut retries = 0;
 
-    while let Some(mut remote_stream) = tun.accept().await {
-        tokio::spawn(async move {
-            let local_address = format!("localhost:{}", args.port);
-            let mut local_stream = match TcpStream::connect(&local_address).await {
-                Ok(stream) => stream,
-                Err(err) => {
-                    eprintln!("Failed to connect to {local_address}");
-                    return Err(err);
+        loop {
+            let mut tun = match Tunnel::builder()
+                .server_url(server_url.clone())
+                .subdomain(args.subdomain.clone())
+                .max_concurrent_streams(args.concurrency)
+                .listen()
+                .await
+            {
+                Ok(tun) => tun,
+                Err(_err) => {
+                    sleep(Duration::from_secs(2)).await;
+
+                    retries += 1;
+                    if retries > 10 {
+                        break;
+                    }
+
+                    continue;
                 }
             };
-            io::copy_bidirectional(&mut remote_stream, &mut local_stream).await?;
-            io::Result::Ok(())
-        });
-    }
+
+            if retries == 0 {
+                println!("Forwarding via: {}", tun.proxy_url());
+            }
+
+            while let Some(mut remote_stream) = tun.accept().await {
+                tokio::spawn(async move {
+                    let local_address = format!("localhost:{}", args.port);
+                    let mut local_stream = match TcpStream::connect(&local_address).await {
+                        Ok(stream) => stream,
+                        Err(err) => {
+                            eprintln!("Failed to connect to {local_address}");
+                            return Err(err);
+                        }
+                    };
+                    io::copy_bidirectional(&mut remote_stream, &mut local_stream).await?;
+                    io::Result::Ok(())
+                });
+            }
+
+            sleep(Duration::from_secs(2)).await;
+
+            retries += 1;
+            if retries > 20 {
+                break;
+            }
+        }
+
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    };
+
+    select! {
+        _ = interrupt => {
+            eprintln!("Exiting...");
+        },
+        _ = proxy => {
+            println!("Server is down");
+        },
+    };
 
     Ok(())
 }

@@ -43,11 +43,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     println!("Forwarding via: {}", tun.proxy_url());
 
     while let Some(mut remote_stream) = tun.accept().await {
-        let mut local_stream = TcpStream::connect(format!("localhost:{}", args.port)).await?;
         tokio::spawn(async move {
-            io::copy_bidirectional(&mut remote_stream, &mut local_stream)
-                .await
-                .ok();
+            let local_address = format!("localhost:{}", args.port);
+            let mut local_stream = match TcpStream::connect(&local_address).await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    eprintln!("Failed to connect to {local_address}");
+                    return Err(err);
+                }
+            };
+            io::copy_bidirectional(&mut remote_stream, &mut local_stream).await?;
+            io::Result::Ok(())
         });
     }
 

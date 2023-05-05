@@ -19,10 +19,11 @@ use tokio::{
     try_join,
 };
 
-use tokio_stream::StreamExt;
 use tracing::{debug, info, metadata::LevelFilter, trace, Instrument};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use tunnel::{TunnelName, Tunnels};
+
+use crate::tunnel::Tunnel;
 
 mod tunnel;
 
@@ -84,15 +85,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                     .body(Body::empty());
                             }
 
-                            // let subdomain = req
-                            //     .headers()
-                            //     .get("x-tinytun-subdomain")
-                            //     .and_then(|subdomain| subdomain.to_str().ok())
-                            //     .map(|subdomain| subdomain.to_owned());
+                            let subdomain = req
+                                .headers()
+                                .get("x-tinytun-subdomain")
+                                .and_then(|subdomain| subdomain.to_str().ok())
+                                .map(|subdomain| subdomain.to_owned());
 
-                            // let mut tun_entry = match tuns.new_http_tunnel(subdomain.clone()).await
-                            let mut tun_entry = match tuns.new_tcp_tunnel().await
-                            {
+                            let mut tun_entry = match tuns.new_http_tunnel(subdomain.clone()).await {
+                            // let mut tun_entry = match tuns.new_tcp_tunnel().await {
                                 Ok(entry) => entry,
                                 Err(_) => {
                                     return Response::builder()
@@ -119,7 +119,27 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                         if let Ok((client, mut h2)) =
                                             h2::client::handshake(conn).await
                                         {
-                                            tun_entry.add_tunnel(client.into()).await;
+                                            let tun: Tunnel = client.into();
+
+                                            let listener = async move {
+                                                let port = match tun_entry.name() {
+                                                    TunnelName::PortNumber(port) => *port,
+                                                    TunnelName::Subdomain(_) => panic!("FUU"),
+                                                };
+                                                let addr = SocketAddr::from(([0, 0, 0, 0], port));
+                                                let listener =
+                                                    TcpListener::bind(&addr).await.unwrap();
+                                                while let Ok((stream, _addr)) =
+                                                    listener.accept().await
+                                                {
+                                                    let tun = tun.clone();
+                                                    tokio::spawn(async move {
+                                                        tun.tunnel(stream).await?;
+                                                        Ok::<_, Box<dyn Error + Send + Sync>>(())
+                                                    });
+                                                }
+                                                Ok::<_, h2::Error>(())
+                                            };
 
                                             let mut ping_pong = h2.ping_pong().unwrap();
                                             #[allow(unreachable_code)]
@@ -137,6 +157,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                             if let Err(err) = tokio::select! {
                                                 result = h2 => result,
                                                 result = ping => result,
+                                                result = listener => result,
                                             } {
                                                 debug!(error = %err, "Error");
                                             }
@@ -253,30 +274,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     };
 
-    let tcp_proxy = async {
-        let tuns = tuns.clone();
-
-        while let Some((tun, port)) = tuns.tcp_tunnels().next().await {
-            tokio::spawn(async move {
-                let addr = SocketAddr::from(([0, 0, 0, 0], port));
-                let listener = TcpListener::bind(&addr).await?;
-
-                while let Ok((stream, _addr)) = listener.accept().await {
-                    let tun = tun.clone();
-                    tokio::spawn(async move {
-                        tun.tunnel(stream).await?;
-                        Ok::<_, Box<dyn Error + Send + Sync>>(())
-                    });
-                }
-
-                Ok::<_, Box<dyn Error + Send + Sync>>(port)
-            });
-        }
-
-        Ok::<_, Box<dyn Error + Send + Sync>>(())
-    };
-
-    try_join!(api, http_proxy, tcp_proxy, metadata_api)?;
+    try_join!(api, http_proxy, metadata_api)?;
 
     Ok(())
 }

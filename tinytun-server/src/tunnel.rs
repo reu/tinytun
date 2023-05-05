@@ -11,7 +11,6 @@ use std::{
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use futures::Stream;
 use hyper::Request;
 use pin_project_lite::pin_project;
 use rand::Rng;
@@ -20,9 +19,7 @@ use tinytun::TunnelStream;
 use tokio::{
     io::{self, AsyncRead, AsyncWrite},
     net::TcpStream,
-    sync::broadcast,
 };
-use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -99,16 +96,13 @@ impl Display for TunnelName {
 pub struct Tunnels {
     tunnels: DashMap<TunnelId, (Tunnel, TunnelName)>,
     names: DashMap<TunnelName, TunnelId>,
-    tcp_tunnels_broadcast: broadcast::Sender<(Tunnel, u16)>,
 }
 
 impl Tunnels {
     pub fn new() -> Self {
-        let (tcp_tunnels_broadcast, _) = broadcast::channel(10);
         Self {
             tunnels: DashMap::new(),
             names: DashMap::new(),
-            tcp_tunnels_broadcast,
         }
     }
 
@@ -135,23 +129,19 @@ impl Tunnels {
 
     pub async fn new_tcp_tunnel(
         self: &Arc<Self>,
-    ) -> Result<TunnelEntry, Box<dyn Error + Send + Sync>> {
+    ) -> Result<u16, Box<dyn Error + Send + Sync>> {
         let tun_id = TunnelId::new();
-        let name = loop {
-            let name = TunnelName::PortNumber(rand::thread_rng().gen::<u16>());
+        let (name, port) = loop {
+            let port = rand::thread_rng().gen::<u16>();
+            let name = TunnelName::PortNumber(port);
             if !self.names.contains_key(&name) {
-                break name;
+                break (name, port);
             }
         };
 
         self.names.insert(name.clone(), tun_id);
 
-        Ok(TunnelEntry {
-            tun_id,
-            name,
-            registry: self.clone(),
-            persisted: false,
-        })
+        Ok(port)
     }
 
     pub async fn tunnel_for_name(&self, name: &TunnelName) -> Option<Tunnel> {
@@ -163,10 +153,6 @@ impl Tunnels {
         if let Some((_, (_, name))) = self.tunnels.remove(&tun_id) {
             self.names.remove(&name);
         }
-    }
-
-    pub fn tcp_tunnels(&self) -> impl Stream<Item = (Tunnel, u16)> {
-        BroadcastStream::new(self.tcp_tunnels_broadcast.subscribe()).filter_map(|tun| tun.ok())
     }
 
     pub async fn list_tunnels_metadata(&self) -> impl Iterator<Item = TunnelMetadata> + '_ {
@@ -211,16 +197,6 @@ impl TunnelEntry {
             .tunnels
             .insert(self.tun_id, (tunnel.clone(), self.name.clone()));
         self.persisted = true;
-
-        match self.name {
-            TunnelName::PortNumber(port) => {
-                self.registry
-                    .tcp_tunnels_broadcast
-                    .send((tunnel, port))
-                    .ok();
-            }
-            _ => {}
-        }
     }
 }
 

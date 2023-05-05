@@ -19,9 +19,10 @@ use tokio::{
     try_join,
 };
 
+use tokio_stream::StreamExt;
 use tracing::{debug, info, metadata::LevelFilter, trace, Instrument};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use tunnel::Tunnels;
+use tunnel::{TunnelName, Tunnels};
 
 mod tunnel;
 
@@ -83,13 +84,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                     .body(Body::empty());
                             }
 
-                            let subdomain = req
-                                .headers()
-                                .get("x-tinytun-subdomain")
-                                .and_then(|subdomain| subdomain.to_str().ok())
-                                .map(|subdomain| subdomain.to_owned());
+                            // let subdomain = req
+                            //     .headers()
+                            //     .get("x-tinytun-subdomain")
+                            //     .and_then(|subdomain| subdomain.to_str().ok())
+                            //     .map(|subdomain| subdomain.to_owned());
 
-                            let mut tun_entry = match tuns.new_tunnel(subdomain.clone()).await {
+                            // let mut tun_entry = match tuns.new_http_tunnel(subdomain.clone()).await
+                            let mut tun_entry = match tuns.new_tcp_tunnel().await
+                            {
                                 Ok(entry) => entry,
                                 Err(_) => {
                                     return Response::builder()
@@ -98,7 +101,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 }
                             };
 
-                            let subdomain = tun_entry.subdomain().to_string();
+                            let subdomain = tun_entry.name().to_string();
                             let tun_id = tun_entry.id();
 
                             let res = Response::builder()
@@ -194,7 +197,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     };
 
-    let tcp_proxy = async {
+    let http_proxy = async {
         let tuns = tuns.clone();
         let addr = SocketAddr::from(([0, 0, 0, 0], proxy_port));
         let listener = TcpListener::bind(&addr).await?;
@@ -206,7 +209,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 let host = peek_host(&stream).await?;
 
                 let subdomain = match host.split_once('.').map(|(tun_id, _)| tun_id) {
-                    Some(id) => id,
+                    Some(id) => TunnelName::Subdomain(id.to_string()),
                     None => {
                         HttpServer::new()
                             .serve_connection(
@@ -222,10 +225,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     }
                 };
 
-                match tuns.tunnel_for_subdomain(subdomain).await {
+                match tuns.tunnel_for_name(&subdomain).await {
                     Some(tun) => {
                         tun.tunnel(stream)
-                            .instrument(tracing::error_span!("Tunneling", subdomain))
+                            .instrument(tracing::error_span!(
+                                "Tunneling",
+                                subdomain = subdomain.to_string()
+                            ))
                             .await?;
                     }
                     None => {
@@ -247,7 +253,30 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     };
 
-    try_join!(api, tcp_proxy, metadata_api)?;
+    let tcp_proxy = async {
+        let tuns = tuns.clone();
+
+        while let Some((tun, port)) = tuns.tcp_tunnels().next().await {
+            tokio::spawn(async move {
+                let addr = SocketAddr::from(([0, 0, 0, 0], port));
+                let listener = TcpListener::bind(&addr).await?;
+
+                while let Ok((stream, _addr)) = listener.accept().await {
+                    let tun = tun.clone();
+                    tokio::spawn(async move {
+                        tun.tunnel(stream).await?;
+                        Ok::<_, Box<dyn Error + Send + Sync>>(())
+                    });
+                }
+
+                Ok::<_, Box<dyn Error + Send + Sync>>(port)
+            });
+        }
+
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    };
+
+    try_join!(api, http_proxy, tcp_proxy, metadata_api)?;
 
     Ok(())
 }

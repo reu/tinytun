@@ -11,16 +11,20 @@ use std::{
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use futures::Stream;
 use hyper::Request;
 use pin_project_lite::pin_project;
-use rand::{thread_rng, Rng};
+use rand::Rng;
 use serde::{Serialize, Serializer};
 use tinytun::TunnelStream;
 use tokio::{
     io::{self, AsyncRead, AsyncWrite},
     net::TcpStream,
+    sync::broadcast,
 };
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tracing::instrument;
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct Tunnel {
@@ -57,21 +61,17 @@ impl From<h2::client::SendRequest<Bytes>> for Tunnel {
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub struct TunnelId([u8; 16]);
+pub struct TunnelId(Uuid);
 
 impl TunnelId {
     pub fn new() -> Self {
-        // TODO: use uuid instead
-        TunnelId(thread_rng().gen())
+        TunnelId(Uuid::new_v4())
     }
 }
 
 impl Display for TunnelId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
+        write!(f, "{}", self.0.as_simple())
     }
 }
 
@@ -81,57 +81,100 @@ impl Serialize for TunnelId {
     }
 }
 
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize)]
+pub enum TunnelName {
+    Subdomain(String),
+    PortNumber(u16),
+}
+
+impl Display for TunnelName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TunnelName::Subdomain(name) => write!(f, "{}", name),
+            TunnelName::PortNumber(num) => write!(f, ":{}", num),
+        }
+    }
+}
+
 pub struct Tunnels {
-    tunnels: DashMap<TunnelId, (Tunnel, String)>,
-    subdomains: DashMap<String, TunnelId>,
+    tunnels: DashMap<TunnelId, (Tunnel, TunnelName)>,
+    names: DashMap<TunnelName, TunnelId>,
+    tcp_tunnels_broadcast: broadcast::Sender<(Tunnel, u16)>,
 }
 
 impl Tunnels {
     pub fn new() -> Self {
+        let (tcp_tunnels_broadcast, _) = broadcast::channel(10);
         Self {
             tunnels: DashMap::new(),
-            subdomains: DashMap::new(),
+            names: DashMap::new(),
+            tcp_tunnels_broadcast,
         }
     }
 
-    pub async fn new_tunnel(
+    pub async fn new_http_tunnel(
         self: &Arc<Self>,
-        subdomain: Option<String>,
+        name: Option<String>,
     ) -> Result<TunnelEntry, Box<dyn Error + Send + Sync>> {
         let tun_id = TunnelId::new();
-        let subdomain = subdomain.unwrap_or_else(|| tun_id.to_string());
+        let name = TunnelName::Subdomain(name.unwrap_or_else(|| tun_id.to_string()));
 
-        if self.subdomains.contains_key(&subdomain) {
-            return Err("Subdomain already in use".into());
+        if self.names.contains_key(&name) {
+            return Err("Name already in use".into());
         }
 
-        self.subdomains.insert(subdomain.clone(), tun_id);
+        self.names.insert(name.clone(), tun_id);
 
         Ok(TunnelEntry {
             tun_id,
-            subdomain,
+            name,
             registry: self.clone(),
             persisted: false,
         })
     }
 
-    pub async fn tunnel_for_subdomain(&self, subdomain: &str) -> Option<Tunnel> {
-        let tun_id = self.subdomains.get(subdomain)?;
+    pub async fn new_tcp_tunnel(
+        self: &Arc<Self>,
+    ) -> Result<TunnelEntry, Box<dyn Error + Send + Sync>> {
+        let tun_id = TunnelId::new();
+        let name = loop {
+            let name = TunnelName::PortNumber(rand::thread_rng().gen::<u16>());
+            if !self.names.contains_key(&name) {
+                break name;
+            }
+        };
+
+        self.names.insert(name.clone(), tun_id);
+
+        Ok(TunnelEntry {
+            tun_id,
+            name,
+            registry: self.clone(),
+            persisted: false,
+        })
+    }
+
+    pub async fn tunnel_for_name(&self, name: &TunnelName) -> Option<Tunnel> {
+        let tun_id = self.names.get(name)?;
         self.tunnels.get(&tun_id).map(|tun| tun.value().0.clone())
     }
 
     pub async fn remove_tunnel(&self, tun_id: TunnelId) {
-        if let Some((_, (_, subdomain))) = self.tunnels.remove(&tun_id) {
-            self.subdomains.remove(&subdomain);
+        if let Some((_, (_, name))) = self.tunnels.remove(&tun_id) {
+            self.names.remove(&name);
         }
+    }
+
+    pub fn tcp_tunnels(&self) -> impl Stream<Item = (Tunnel, u16)> {
+        BroadcastStream::new(self.tcp_tunnels_broadcast.subscribe()).filter_map(|tun| tun.ok())
     }
 
     pub async fn list_tunnels_metadata(&self) -> impl Iterator<Item = TunnelMetadata> + '_ {
         self.tunnels.iter().map(|item| {
-            let (tunnel, subdomain) = item.value();
+            let (tunnel, name) = item.value();
             TunnelMetadata {
                 id: *item.key(),
-                subdomain: subdomain.clone(),
+                name: name.clone(),
                 read_bytes: tunnel.read_bytes.load(Ordering::Relaxed),
                 written_bytes: tunnel.written_bytes.load(Ordering::Relaxed),
             }
@@ -142,14 +185,14 @@ impl Tunnels {
 #[derive(Debug, Clone, Serialize)]
 pub struct TunnelMetadata {
     pub id: TunnelId,
-    pub subdomain: String,
+    pub name: TunnelName,
     pub read_bytes: usize,
     pub written_bytes: usize,
 }
 
 pub struct TunnelEntry {
     tun_id: TunnelId,
-    subdomain: String,
+    name: TunnelName,
     registry: Arc<Tunnels>,
     persisted: bool,
 }
@@ -159,24 +202,34 @@ impl TunnelEntry {
         self.tun_id
     }
 
-    pub fn subdomain(&self) -> &str {
-        self.subdomain.as_str()
+    pub fn name(&self) -> &TunnelName {
+        &self.name
     }
 
     pub async fn add_tunnel(&mut self, tunnel: Tunnel) {
         self.registry
             .tunnels
-            .insert(self.tun_id, (tunnel, self.subdomain.clone()));
+            .insert(self.tun_id, (tunnel.clone(), self.name.clone()));
         self.persisted = true;
+
+        match self.name {
+            TunnelName::PortNumber(port) => {
+                self.registry
+                    .tcp_tunnels_broadcast
+                    .send((tunnel, port))
+                    .ok();
+            }
+            _ => {}
+        }
     }
 }
 
 impl Drop for TunnelEntry {
     fn drop(&mut self) {
         if !self.persisted {
-            let subdomain = self.subdomain.clone();
+            let subdomain = self.name.clone();
             let tunnels = self.registry.clone();
-            tunnels.subdomains.remove(&subdomain);
+            tunnels.names.remove(&subdomain);
         }
     }
 }

@@ -1,13 +1,31 @@
 use std::{env, error::Error, time::Duration};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use http::Uri;
 use tinytun::Tunnel;
 use tokio::{io, net::TcpStream, select, signal, time::sleep};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum TunnelType {
+    Tcp,
+    Http,
+}
+
+impl From<TunnelType> for tinytun::TunnelType {
+    fn from(value: TunnelType) -> Self {
+        match value {
+            TunnelType::Tcp => tinytun::TunnelType::Tcp,
+            TunnelType::Http => tinytun::TunnelType::Http,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// Type
+    tunnel_type: TunnelType,
+
     /// Local web service port
     port: u16,
 
@@ -42,6 +60,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .server_url(server_url.clone())
                 .subdomain(args.subdomain.clone())
                 .max_concurrent_streams(args.concurrency)
+                .tunnel_type(args.tunnel_type)
                 .listen()
                 .await
             {

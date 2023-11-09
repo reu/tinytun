@@ -35,6 +35,7 @@ impl Tunnel {
     pub async fn tunnel(&self, mut stream: TcpStream) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut client = self.client.clone().ready().await?;
         let (res, send_stream) = client.send_request(Request::new(()), false)?;
+        println!("AQUI?");
         let res = res.await?;
         let tunnel_stream = TunnelStream::new(res.into_body(), send_stream);
         let mut tunnel_stream = StreamMonitor {
@@ -129,19 +130,31 @@ impl Tunnels {
 
     pub async fn new_tcp_tunnel(
         self: &Arc<Self>,
-    ) -> Result<u16, Box<dyn Error + Send + Sync>> {
+        port: Option<u16>,
+    ) -> Result<(TunnelId, u16), Box<dyn Error + Send + Sync>> {
         let tun_id = TunnelId::new();
-        let (name, port) = loop {
-            let port = rand::thread_rng().gen::<u16>();
-            let name = TunnelName::PortNumber(port);
-            if !self.names.contains_key(&name) {
-                break (name, port);
+
+        let (name, port) = match port {
+            Some(port) => {
+                let name = TunnelName::PortNumber(port);
+                if !self.names.contains_key(&name) {
+                    (name, port)
+                } else {
+                    return Err("Port already in use".into());
+                }
             }
+            None => loop {
+                let port = rand::thread_rng().gen_range(20_000..60_000);
+                let name = TunnelName::PortNumber(port);
+                if !self.names.contains_key(&name) {
+                    break (name, port);
+                }
+            },
         };
 
         self.names.insert(name.clone(), tun_id);
 
-        Ok(port)
+        Ok((tun_id, port))
     }
 
     pub async fn tunnel_for_name(&self, name: &TunnelName) -> Option<Tunnel> {

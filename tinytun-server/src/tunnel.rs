@@ -35,7 +35,6 @@ impl Tunnel {
     pub async fn tunnel(&self, mut stream: TcpStream) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut client = self.client.clone().ready().await?;
         let (res, send_stream) = client.send_request(Request::new(()), false)?;
-        println!("AQUI?");
         let res = res.await?;
         let tunnel_stream = TunnelStream::new(res.into_body(), send_stream);
         let mut tunnel_stream = StreamMonitor {

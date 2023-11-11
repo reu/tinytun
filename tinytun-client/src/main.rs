@@ -27,11 +27,15 @@ struct Args {
     tunnel_type: TunnelType,
 
     /// Local web service port
-    port: u16,
+    local_port: u16,
 
     /// Subdomain to use
     #[arg(short, long)]
     subdomain: Option<String>,
+
+    /// Remote port to use (must be in the 20000-60000 range)
+    #[arg(short, long)]
+    port: Option<u16>,
 
     /// Maximum number of concurrent connections allowed on the local service
     #[arg(short, long, default_value_t = 100)]
@@ -59,6 +63,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             let mut tun = match Tunnel::builder()
                 .server_url(server_url.clone())
                 .subdomain(args.subdomain.clone())
+                .port(args.port)
                 .max_concurrent_streams(args.concurrency)
                 .tunnel_type(args.tunnel_type)
                 .listen()
@@ -83,7 +88,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
             while let Some(mut remote_stream) = tun.accept().await {
                 tokio::spawn(async move {
-                    let local_address = format!("localhost:{}", args.port);
+                    let local_address = format!("localhost:{}", args.local_port);
                     let mut local_stream = match TcpStream::connect(&local_address).await {
                         Ok(stream) => stream,
                         Err(err) => {

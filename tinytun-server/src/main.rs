@@ -14,6 +14,7 @@ use hyper::{
     Body, Method, Request, Response, Server, StatusCode,
 };
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     time::sleep,
     try_join,
@@ -173,6 +174,72 @@ async fn tcp_tunnel(
     Ok(res)
 }
 
+async fn tcp_proxy_tunnel(
+    tuns: Arc<Tunnels>,
+    mut req: Request<Body>,
+) -> Result<Response<Body>, Box<dyn Error + Send + Sync>> {
+    let port = req
+        .headers()
+        .get("x-tinytun-port")
+        .and_then(|port| port.to_str().ok())
+        .and_then(|port| port.parse::<u16>().ok());
+
+    let (mut tun_entry, port) = match tuns.new_tcp_proxy_tunnel(port).await {
+        Ok(entry) => entry,
+        Err(_) => {
+            return Ok(Response::builder()
+                .status(StatusCode::CONFLICT)
+                .body(Body::from("Port not available"))?);
+        }
+    };
+
+    let tun_id = tun_entry.id();
+
+    let res = Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header("x-tinytun-connection-id", tun_id.to_string())
+        .header("x-tinytun-port", port)
+        .body(Body::empty())?;
+
+    tokio::spawn(
+        async move {
+            if let Ok(conn) = hyper::upgrade::on(&mut req).await {
+                trace!("Tunnel opened");
+
+                if let Ok((client, mut h2)) = h2::client::handshake(conn).await {
+                    tun_entry.add_tunnel(client.into()).await;
+
+                    let mut ping_pong = h2.ping_pong().unwrap();
+                    #[allow(unreachable_code)]
+                    let ping = async move {
+                        loop {
+                            sleep(Duration::from_secs(10)).await;
+                            trace!("Sending ping");
+                            ping_pong.ping(h2::Ping::opaque()).await?;
+                            trace!("Received pong");
+                        }
+                        Ok::<_, h2::Error>(())
+                    }
+                    .in_current_span();
+
+                    if let Err(err) = tokio::select! {
+                        result = h2 => result,
+                        result = ping => result,
+                    } {
+                        debug!(error = %err, "Error");
+                    }
+                }
+
+                tuns.remove_tunnel(tun_id).await;
+                trace!("Tunnel closed");
+            }
+        }
+        .instrument(tracing::error_span!("Tunnel", kind = "tcp", %port)),
+    );
+
+    Ok(res)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     tracing_subscriber::registry()
@@ -198,6 +265,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .ok()
         .and_then(|port| port.parse::<u16>().ok())
         .unwrap_or(5555);
+
+    let tcp_proxy_port = env::var("TCP_PROXY_PORT")
+        .ok()
+        .and_then(|port| port.parse::<u16>().ok())
+        .unwrap_or(5556);
 
     let base_domain = env::var("BASE_DOMAIN").ok().unwrap_or_else(|| {
         option_env!("DEFAULT_BASE_DOMAIN")
@@ -237,6 +309,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 .and_then(|header| header.to_str().ok())
                             {
                                 Some("tcp") => Ok::<_, Box<dyn Error + Send + Sync>>(
+                                    tcp_proxy_tunnel(tuns, req).await?,
+                                ),
+                                Some("tcp_port") => Ok::<_, Box<dyn Error + Send + Sync>>(
                                     tcp_tunnel(tuns, req).await?,
                                 ),
                                 _ => Ok::<_, Box<dyn Error + Send + Sync>>(
@@ -346,7 +421,48 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     };
 
-    try_join!(api, http_proxy, metadata_api)?;
+    let tcp_proxy = async {
+        let tuns = tuns.clone();
+        let addr = SocketAddr::from(([0, 0, 0, 0], tcp_proxy_port));
+        let listener = TcpListener::bind(&addr).await?;
+        info!("TCP Proxy running on port {}", tcp_proxy_port);
+
+        while let Ok((mut stream, _addr)) = listener.accept().await {
+            debug!("TCP stream accepted");
+            let tuns = tuns.clone();
+            tokio::spawn(async move {
+                let port = match parse_proxy_protocol(&mut stream).await {
+                    Ok(port) => TunnelName::PortNumber(port),
+                    Err(err) => {
+                        debug!(err, "Failed to parse proxy protocol");
+                        stream.shutdown().await?;
+                        return Err(err);
+                    }
+                };
+                debug!(port = port.to_string(), "TCP port received");
+
+                match tuns.tunnel_for_name(&port).await {
+                    Some(tun) => {
+                        debug!(port = port.to_string(), "TCP tunnel found");
+                        tun.tunnel(stream)
+                            .instrument(tracing::error_span!(
+                                "TCP Tunneling",
+                                port = port.to_string()
+                            ))
+                            .await?;
+                    }
+                    None => {
+                        debug!(port = port.to_string(), "TCP stream not found");
+                        stream.shutdown().await?;
+                    }
+                };
+                Ok::<_, Box<dyn Error + Send + Sync>>(())
+            });
+        }
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    };
+
+    try_join!(api, http_proxy, tcp_proxy, metadata_api)?;
 
     Ok(())
 }
@@ -375,4 +491,21 @@ async fn peek_host(stream: &TcpStream) -> Result<String, Box<dyn Error + Send + 
             break Ok(host.to_string());
         }
     }
+}
+
+async fn parse_proxy_protocol(stream: &mut TcpStream) -> Result<u16, Box<dyn Error + Send + Sync>> {
+    let mut header = [0_u8; 16];
+    stream.read_exact(&mut header).await?;
+
+    if &header[0..12] != b"\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A" {
+        return Err("invalid proxy protocol v2 signature".into());
+    }
+
+    let len = u16::from_be_bytes([header[header.len() - 2], header[header.len() - 1]]);
+    debug!(len, "proxy protocol lenght");
+
+    let mut buf = vec![0; len.into()];
+    stream.read_exact(&mut buf).await?;
+
+    Ok(22222)
 }

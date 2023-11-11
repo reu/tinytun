@@ -71,6 +71,7 @@ impl FromStr for TunnelType {
 pub struct TunnelBuilder {
     server_url: Result<Uri, Box<dyn Error + Send + Sync>>,
     subdomain: Option<String>,
+    port: Option<u16>,
     max_concurrent_streams: u32,
     tunnel_type: TunnelType,
 }
@@ -81,6 +82,7 @@ impl Default for TunnelBuilder {
             server_url: Ok(Uri::from_static("https://tinytun.com:5555")),
             max_concurrent_streams: 100,
             subdomain: Default::default(),
+            port: Default::default(),
             tunnel_type: TunnelType::Http,
         }
     }
@@ -105,6 +107,13 @@ impl TunnelBuilder {
     pub fn subdomain(self, subdomain: impl Into<Option<String>>) -> Self {
         Self {
             subdomain: subdomain.into(),
+            ..self
+        }
+    }
+
+    pub fn port(self, port: impl Into<Option<u16>>) -> Self {
+        Self {
+            port: port.into(),
             ..self
         }
     }
@@ -139,11 +148,17 @@ impl TunnelBuilder {
                     .method(Method::CONNECT)
                     .header("x-tinytun-type", self.tunnel_type.to_string());
 
-                match self.subdomain {
-                    Some(subdomain) if !subdomain.trim().is_empty() => req
-                        .header("x-tinytun-subdomain", subdomain)
-                        .body(Body::empty())?,
-                    _ => req.body(Body::empty())?,
+                match self.tunnel_type {
+                    TunnelType::Tcp => match self.port {
+                        Some(port) => req.header("x-tinytun-port", port).body(Body::empty())?,
+                        _ => req.body(Body::empty())?,
+                    },
+                    TunnelType::Http => match self.subdomain {
+                        Some(subdomain) if !subdomain.trim().is_empty() => req
+                            .header("x-tinytun-subdomain", subdomain)
+                            .body(Body::empty())?,
+                        _ => req.body(Body::empty())?,
+                    },
                 }
             })
             .await?;

@@ -127,6 +127,43 @@ impl Tunnels {
         })
     }
 
+    pub async fn new_tcp_proxy_tunnel(
+        self: &Arc<Self>,
+        port: Option<u16>,
+    ) -> Result<(TunnelEntry, u16), Box<dyn Error + Send + Sync>> {
+        let tun_id = TunnelId::new();
+
+        let (name, port) = match port {
+            Some(port) => {
+                let name = TunnelName::PortNumber(port);
+                if !self.names.contains_key(&name) {
+                    (name, port)
+                } else {
+                    return Err("Port already in use".into());
+                }
+            }
+            None => loop {
+                let port = rand::thread_rng().gen_range(20_000..60_000);
+                let name = TunnelName::PortNumber(port);
+                if !self.names.contains_key(&name) {
+                    break (name, port);
+                }
+            },
+        };
+
+        self.names.insert(name.clone(), tun_id);
+
+        Ok((
+            TunnelEntry {
+                tun_id,
+                name,
+                registry: self.clone(),
+                persisted: false,
+            },
+            port,
+        ))
+    }
+
     pub async fn new_tcp_tunnel(
         self: &Arc<Self>,
         port: Option<u16>,

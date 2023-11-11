@@ -52,3 +52,21 @@ kill_timeout = "5s"
     timeout = "2s"
     grace_period = "1s"
     restart_limit = 0
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 5556
+  auto_stop_machines = false
+  auto_start_machines = false
+
+  [[services.ports]]
+    handlers = ["proxy_proto"]
+    start_port = 20000
+    end_port = 60000
+    proxy_proto_options = { version = "v2" }
+
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "1s"
+    restart_limit = 0

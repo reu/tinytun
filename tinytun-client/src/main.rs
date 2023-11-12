@@ -1,19 +1,41 @@
 use std::{env, error::Error, time::Duration};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use http::Uri;
 use tinytun::Tunnel;
 use tokio::{io, net::TcpStream, select, signal, time::sleep};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum TunnelType {
+    Tcp,
+    Http,
+}
+
+impl From<TunnelType> for tinytun::TunnelType {
+    fn from(value: TunnelType) -> Self {
+        match value {
+            TunnelType::Tcp => tinytun::TunnelType::Tcp,
+            TunnelType::Http => tinytun::TunnelType::Http,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// Type
+    tunnel_type: TunnelType,
+
     /// Local web service port
-    port: u16,
+    local_port: u16,
 
     /// Subdomain to use
     #[arg(short, long)]
     subdomain: Option<String>,
+
+    /// Remote port to use (must be in the 20000-60000 range)
+    #[arg(short, long)]
+    port: Option<u16>,
 
     /// Maximum number of concurrent connections allowed on the local service
     #[arg(short, long, default_value_t = 100)]
@@ -41,7 +63,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             let mut tun = match Tunnel::builder()
                 .server_url(server_url.clone())
                 .subdomain(args.subdomain.clone())
+                .port(args.port)
                 .max_concurrent_streams(args.concurrency)
+                .tunnel_type(args.tunnel_type)
                 .listen()
                 .await
             {
@@ -64,7 +88,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
             while let Some(mut remote_stream) = tun.accept().await {
                 tokio::spawn(async move {
-                    let local_address = format!("localhost:{}", args.port);
+                    let local_address = format!("localhost:{}", args.local_port);
                     let mut local_stream = match TcpStream::connect(&local_address).await {
                         Ok(stream) => stream,
                         Err(err) => {

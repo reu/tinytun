@@ -293,6 +293,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 let tuns = tuns.clone();
                 async {
                     Ok::<_, Box<dyn Error + Send + Sync>>(service_fn(move |req| {
+                        debug!("New tunnel request");
                         let tuns = tuns.clone();
                         let base_domain = base_domain.clone();
 
@@ -303,11 +304,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                     .body(Body::empty())?);
                             }
 
-                            match req
+                            let tunnel_type = req
                                 .headers()
                                 .get("x-tinytun-type")
-                                .and_then(|header| header.to_str().ok())
-                            {
+                                .and_then(|header| header.to_str().ok());
+
+                            debug!(tunnel_type, "Tunnel type creation requested");
+
+                            match tunnel_type {
                                 Some("tcp") => Ok::<_, Box<dyn Error + Send + Sync>>(
                                     tcp_proxy_tunnel(tuns, req).await?,
                                 ),
@@ -434,7 +438,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 let port = match parse_proxy_protocol(&mut stream).await {
                     Ok(port) => TunnelName::PortNumber(port),
                     Err(err) => {
-                        debug!(err, "Failed to parse proxy protocol");
                         stream.shutdown().await?;
                         return Err(err);
                     }

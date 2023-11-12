@@ -496,6 +496,7 @@ async fn peek_host(stream: &TcpStream) -> Result<String, Box<dyn Error + Send + 
     }
 }
 
+// See: https://www.haproxy.org/download/2.4/doc/proxy-protocol.txt
 async fn parse_proxy_protocol(stream: &mut TcpStream) -> Result<u16, Box<dyn Error + Send + Sync>> {
     let mut header = [0_u8; 16];
     stream.read_exact(&mut header).await?;
@@ -510,5 +511,9 @@ async fn parse_proxy_protocol(stream: &mut TcpStream) -> Result<u16, Box<dyn Err
     let mut buf = vec![0; len.into()];
     stream.read_exact(&mut buf).await?;
 
-    Ok(22222)
+    // We are just interested in the destination port
+    let port = u16::from_be_bytes([buf[10], buf[11]]);
+    debug!(port, "proxy protocol parsed");
+
+    Ok(port)
 }

@@ -299,9 +299,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
                         async move {
                             if req.method() != Method::CONNECT {
-                                return Ok(Response::builder()
-                                    .status(StatusCode::OK)
-                                    .body(Body::empty())?);
+                                return Ok::<_, Box<dyn Error + Send + Sync>>(
+                                    Response::builder()
+                                        .status(StatusCode::OK)
+                                        .body(Body::empty())?,
+                                );
                             }
 
                             let tunnel_type = req
@@ -312,15 +314,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                             debug!(tunnel_type, "Tunnel type creation requested");
 
                             match tunnel_type {
-                                Some("tcp") => Ok::<_, Box<dyn Error + Send + Sync>>(
-                                    tcp_proxy_tunnel(tuns, req).await?,
-                                ),
-                                Some("tcp_port") => Ok::<_, Box<dyn Error + Send + Sync>>(
-                                    tcp_tunnel(tuns, req).await?,
-                                ),
-                                _ => Ok::<_, Box<dyn Error + Send + Sync>>(
-                                    http_tunnel(&base_domain, tuns, req).await?,
-                                ),
+                                Some("tcp") => Ok(tcp_proxy_tunnel(tuns, req).await?),
+                                Some("tcp_port") => Ok(tcp_tunnel(tuns, req).await?),
+                                _ => Ok(http_tunnel(&base_domain, tuns, req).await?),
                             }
                         }
                     }))

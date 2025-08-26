@@ -9,12 +9,12 @@ participant TinytunClient as Tinytun Client
 participant TinytunServer as Tinytun Server
 participant User as User outside<br/>of local network
 
-box transparent Internal Network
+box rgba(255,240,200,0.3) Internal Network
     participant Local WEB service
     participant TinytunClient
 end
 
-box transparent External Network
+box rgba(240,240,255,0.3) External Network
     participant TinytunServer
     participant User
 end

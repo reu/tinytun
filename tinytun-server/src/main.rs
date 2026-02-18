@@ -20,7 +20,7 @@ use tokio::{
     try_join,
 };
 
-use tracing::{debug, info, metadata::LevelFilter, trace, Instrument};
+use tracing::{debug, info, metadata::LevelFilter, trace, warn, Instrument};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use tunnel::{Tunnel, TunnelName, Tunnels};
 
@@ -58,43 +58,49 @@ async fn http_tunnel(
 
     tokio::spawn(
         async move {
-            if let Ok(conn) = hyper::upgrade::on(&mut req).await {
-                trace!("Tunnel opened");
+            match hyper::upgrade::on(&mut req).await {
+                Ok(conn) => {
+                    trace!("Tunnel opened");
 
-                if let Ok((client, mut h2)) = h2::client::handshake(conn).await {
-                    tun_entry.add_tunnel(client.into()).await;
+                    match h2::client::handshake(conn).await {
+                        Ok((client, mut h2)) => {
+                            tun_entry.add_tunnel(client.into()).await;
 
-                    let mut ping_pong = h2.ping_pong().unwrap();
-                    #[allow(unreachable_code)]
-                    let ping = async move {
-                        loop {
-                            sleep(Duration::from_secs(10)).await;
-                            trace!("Sending ping");
-                            match timeout(
-                                Duration::from_secs(15),
-                                ping_pong.ping(h2::Ping::opaque()),
-                            )
-                            .await
-                            {
-                                Ok(Ok(_)) => trace!("Received pong"),
-                                Ok(Err(err)) => return Err(err),
-                                Err(_) => return Err(h2::Reason::NO_ERROR.into()),
+                            let mut ping_pong = h2.ping_pong().unwrap();
+                            #[allow(unreachable_code)]
+                            let ping = async move {
+                                loop {
+                                    sleep(Duration::from_secs(10)).await;
+                                    trace!("Sending ping");
+                                    match timeout(
+                                        Duration::from_secs(15),
+                                        ping_pong.ping(h2::Ping::opaque()),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(_)) => trace!("Received pong"),
+                                        Ok(Err(err)) => return Err(err),
+                                        Err(_) => return Err(h2::Reason::NO_ERROR.into()),
+                                    }
+                                }
+                                Ok::<_, h2::Error>(())
+                            }
+                            .in_current_span();
+
+                            if let Err(err) = tokio::select! {
+                                result = h2 => result,
+                                result = ping => result,
+                            } {
+                                warn!(error = %err, "Tunnel error");
                             }
                         }
-                        Ok::<_, h2::Error>(())
+                        Err(err) => warn!(error = %err, "H2 handshake failed"),
                     }
-                    .in_current_span();
 
-                    if let Err(err) = tokio::select! {
-                        result = h2 => result,
-                        result = ping => result,
-                    } {
-                        debug!(error = %err, "Error");
-                    }
+                    tuns.remove_tunnel(tun_id).await;
+                    trace!("Tunnel closed");
                 }
-
-                tuns.remove_tunnel(tun_id).await;
-                trace!("Tunnel closed");
+                Err(err) => warn!(error = %err, "HTTP upgrade failed"),
             }
         }
         .instrument(tracing::error_span!("Tunnel", kind = "http", %subdomain)),
@@ -132,58 +138,65 @@ async fn tcp_tunnel(
 
     tokio::spawn(
         async move {
-            if let Ok(conn) = hyper::upgrade::on(&mut req).await {
-                trace!("Tunnel opened");
+            match hyper::upgrade::on(&mut req).await {
+                Ok(conn) => {
+                    trace!("Tunnel opened");
 
-                if let Ok((client, mut h2)) = h2::client::handshake(conn).await {
-                    let tun: Tunnel = client.into();
-                    let listener = async move {
-                        let addr = SocketAddr::from(([0, 0, 0, 0], port));
-                        let listener = TcpListener::bind(&addr)
-                            .await
-                            .map_err(|_err| h2::Error::from(h2::Reason::INTERNAL_ERROR))?;
-                        while let Ok((stream, _addr)) = listener.accept().await {
-                            let tun = tun.clone();
-                            tokio::spawn(async move {
-                                tun.tunnel(stream).await?;
-                                Ok::<_, Box<dyn Error + Send + Sync>>(())
-                            });
-                        }
-                        Ok::<_, h2::Error>(())
-                    };
+                    match h2::client::handshake(conn).await {
+                        Ok((client, mut h2)) => {
+                            let tun: Tunnel = client.into();
+                            let listener = async move {
+                                let addr = SocketAddr::from(([0, 0, 0, 0], port));
+                                let listener = TcpListener::bind(&addr)
+                                    .await
+                                    .map_err(|_err| h2::Error::from(h2::Reason::INTERNAL_ERROR))?;
+                                while let Ok((stream, _addr)) = listener.accept().await {
+                                    let tun = tun.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(err) = tun.tunnel(stream).await {
+                                            warn!(error = %err, "TCP tunnel stream error");
+                                        }
+                                    });
+                                }
+                                Ok::<_, h2::Error>(())
+                            };
 
-                    let mut ping_pong = h2.ping_pong().unwrap();
-                    #[allow(unreachable_code)]
-                    let ping = async move {
-                        loop {
-                            sleep(Duration::from_secs(10)).await;
-                            trace!("Sending ping");
-                            match timeout(
-                                Duration::from_secs(15),
-                                ping_pong.ping(h2::Ping::opaque()),
-                            )
-                            .await
-                            {
-                                Ok(Ok(_)) => trace!("Received pong"),
-                                Ok(Err(err)) => return Err(err),
-                                Err(_) => return Err(h2::Reason::NO_ERROR.into()),
+                            let mut ping_pong = h2.ping_pong().unwrap();
+                            #[allow(unreachable_code)]
+                            let ping = async move {
+                                loop {
+                                    sleep(Duration::from_secs(10)).await;
+                                    trace!("Sending ping");
+                                    match timeout(
+                                        Duration::from_secs(15),
+                                        ping_pong.ping(h2::Ping::opaque()),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(_)) => trace!("Received pong"),
+                                        Ok(Err(err)) => return Err(err),
+                                        Err(_) => return Err(h2::Reason::NO_ERROR.into()),
+                                    }
+                                }
+                                Ok::<_, h2::Error>(())
+                            }
+                            .in_current_span();
+
+                            if let Err(err) = tokio::select! {
+                                result = h2 => result,
+                                result = ping => result,
+                                result = listener => result,
+                            } {
+                                warn!(error = %err, "Tunnel error");
                             }
                         }
-                        Ok::<_, h2::Error>(())
+                        Err(err) => warn!(error = %err, "H2 handshake failed"),
                     }
-                    .in_current_span();
 
-                    if let Err(err) = tokio::select! {
-                        result = h2 => result,
-                        result = ping => result,
-                        result = listener => result,
-                    } {
-                        debug!(error = %err, "Error");
-                    }
+                    tuns.remove_tunnel(tun_id).await;
+                    trace!("Tunnel closed");
                 }
-
-                tuns.remove_tunnel(tun_id).await;
-                trace!("Tunnel closed");
+                Err(err) => warn!(error = %err, "HTTP upgrade failed"),
             }
         }
         .instrument(tracing::error_span!("Tunnel", kind = "tcp", %port)),
@@ -223,43 +236,49 @@ async fn tcp_proxy_tunnel(
 
     tokio::spawn(
         async move {
-            if let Ok(conn) = hyper::upgrade::on(&mut req).await {
-                trace!("Tunnel opened");
+            match hyper::upgrade::on(&mut req).await {
+                Ok(conn) => {
+                    trace!("Tunnel opened");
 
-                if let Ok((client, mut h2)) = h2::client::handshake(conn).await {
-                    tun_entry.add_tunnel(client.into()).await;
+                    match h2::client::handshake(conn).await {
+                        Ok((client, mut h2)) => {
+                            tun_entry.add_tunnel(client.into()).await;
 
-                    let mut ping_pong = h2.ping_pong().unwrap();
-                    #[allow(unreachable_code)]
-                    let ping = async move {
-                        loop {
-                            sleep(Duration::from_secs(10)).await;
-                            trace!("Sending ping");
-                            match timeout(
-                                Duration::from_secs(15),
-                                ping_pong.ping(h2::Ping::opaque()),
-                            )
-                            .await
-                            {
-                                Ok(Ok(_)) => trace!("Received pong"),
-                                Ok(Err(err)) => return Err(err),
-                                Err(_) => return Err(h2::Reason::NO_ERROR.into()),
+                            let mut ping_pong = h2.ping_pong().unwrap();
+                            #[allow(unreachable_code)]
+                            let ping = async move {
+                                loop {
+                                    sleep(Duration::from_secs(10)).await;
+                                    trace!("Sending ping");
+                                    match timeout(
+                                        Duration::from_secs(15),
+                                        ping_pong.ping(h2::Ping::opaque()),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(_)) => trace!("Received pong"),
+                                        Ok(Err(err)) => return Err(err),
+                                        Err(_) => return Err(h2::Reason::NO_ERROR.into()),
+                                    }
+                                }
+                                Ok::<_, h2::Error>(())
+                            }
+                            .in_current_span();
+
+                            if let Err(err) = tokio::select! {
+                                result = h2 => result,
+                                result = ping => result,
+                            } {
+                                warn!(error = %err, "Tunnel error");
                             }
                         }
-                        Ok::<_, h2::Error>(())
+                        Err(err) => warn!(error = %err, "H2 handshake failed"),
                     }
-                    .in_current_span();
 
-                    if let Err(err) = tokio::select! {
-                        result = h2 => result,
-                        result = ping => result,
-                    } {
-                        debug!(error = %err, "Error");
-                    }
+                    tuns.remove_tunnel(tun_id).await;
+                    trace!("Tunnel closed");
                 }
-
-                tuns.remove_tunnel(tun_id).await;
-                trace!("Tunnel closed");
+                Err(err) => warn!(error = %err, "HTTP upgrade failed"),
             }
         }
         .instrument(tracing::error_span!("Tunnel", kind = "tcp", %port)),
@@ -372,52 +391,59 @@ async fn start_http_proxy(
     while let Ok((stream, _addr)) = listener.accept().await {
         let tuns = tuns.clone();
         tokio::spawn(async move {
-            let host = timeout(Duration::from_secs(5), peek_host(&stream))
-                .await
-                .map_err(|_| -> Box<dyn Error + Send + Sync> {
-                    "Timed out reading Host header".into()
-                })??;
+            let result: Result<(), Box<dyn Error + Send + Sync>> = async {
+                let host = timeout(Duration::from_secs(5), peek_host(&stream))
+                    .await
+                    .map_err(|_| -> Box<dyn Error + Send + Sync> {
+                        "Timed out reading Host header".into()
+                    })??;
 
-            let subdomain = match host.split_once('.').map(|(tun_id, _)| tun_id) {
-                Some(id) => TunnelName::Subdomain(id.to_string()),
-                None => {
-                    HttpServer::new()
-                        .serve_connection(
-                            stream,
-                            service_fn(|_| async {
-                                Response::builder()
-                                    .status(StatusCode::NOT_FOUND)
-                                    .body(Body::from("Tunnel not informed"))
-                            }),
-                        )
-                        .await?;
-                    return Ok::<_, Box<dyn Error + Send + Sync>>(());
-                }
-            };
+                let subdomain = match host.split_once('.').map(|(tun_id, _)| tun_id) {
+                    Some(id) => TunnelName::Subdomain(id.to_string()),
+                    None => {
+                        HttpServer::new()
+                            .serve_connection(
+                                stream,
+                                service_fn(|_| async {
+                                    Response::builder()
+                                        .status(StatusCode::NOT_FOUND)
+                                        .body(Body::from("Tunnel not informed"))
+                                }),
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+                };
 
-            match tuns.tunnel_for_name(&subdomain).await {
-                Some(tun) => {
-                    tun.tunnel(stream)
-                        .instrument(tracing::error_span!(
-                            "Tunneling",
-                            subdomain = subdomain.to_string()
-                        ))
-                        .await?;
-                }
-                None => {
-                    HttpServer::new()
-                        .serve_connection(
-                            stream,
-                            service_fn(|_| async {
-                                Response::builder()
-                                    .status(StatusCode::NOT_FOUND)
-                                    .body(Body::from("Tunnel not found"))
-                            }),
-                        )
-                        .await?;
-                }
-            };
-            Ok::<_, Box<dyn Error + Send + Sync>>(())
+                match tuns.tunnel_for_name(&subdomain).await {
+                    Some(tun) => {
+                        tun.tunnel(stream)
+                            .instrument(tracing::error_span!(
+                                "Tunneling",
+                                subdomain = subdomain.to_string()
+                            ))
+                            .await?;
+                    }
+                    None => {
+                        HttpServer::new()
+                            .serve_connection(
+                                stream,
+                                service_fn(|_| async {
+                                    Response::builder()
+                                        .status(StatusCode::NOT_FOUND)
+                                        .body(Body::from("Tunnel not found"))
+                                }),
+                            )
+                            .await?;
+                    }
+                };
+                Ok(())
+            }
+            .await;
+
+            if let Err(err) = result {
+                warn!(error = %err, "HTTP proxy error");
+            }
         });
     }
 
@@ -437,32 +463,38 @@ async fn start_tcp_proxy(
         debug!("TCP stream accepted");
         let tuns = tuns.clone();
         tokio::spawn(async move {
-            let port = match parse_proxy_protocol(&mut stream).await {
-                Ok(port) => TunnelName::PortNumber(port),
-                Err(err) => {
-                    debug!(error = err, "Could't parse proxy protocol message");
-                    stream.shutdown().await?;
-                    return Err(err);
-                }
-            };
-            debug!(port = port.to_string(), "TCP port received");
+            let result: Result<(), Box<dyn Error + Send + Sync>> = async {
+                let port = match parse_proxy_protocol(&mut stream).await {
+                    Ok(port) => TunnelName::PortNumber(port),
+                    Err(err) => {
+                        stream.shutdown().await?;
+                        return Err(err);
+                    }
+                };
+                debug!(port = port.to_string(), "TCP port received");
 
-            match tuns.tunnel_for_name(&port).await {
-                Some(tun) => {
-                    debug!(port = port.to_string(), "TCP tunnel found");
-                    tun.tunnel(stream)
-                        .instrument(tracing::error_span!(
-                            "TCP Tunneling",
-                            port = port.to_string()
-                        ))
-                        .await?;
-                }
-                None => {
-                    debug!(port = port.to_string(), "TCP stream not found");
-                    stream.shutdown().await?;
-                }
-            };
-            Ok::<_, Box<dyn Error + Send + Sync>>(())
+                match tuns.tunnel_for_name(&port).await {
+                    Some(tun) => {
+                        debug!(port = port.to_string(), "TCP tunnel found");
+                        tun.tunnel(stream)
+                            .instrument(tracing::error_span!(
+                                "TCP Tunneling",
+                                port = port.to_string()
+                            ))
+                            .await?;
+                    }
+                    None => {
+                        debug!(port = port.to_string(), "TCP stream not found");
+                        stream.shutdown().await?;
+                    }
+                };
+                Ok(())
+            }
+            .await;
+
+            if let Err(err) = result {
+                warn!(error = %err, "TCP proxy error");
+            }
         });
     }
 

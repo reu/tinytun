@@ -92,6 +92,8 @@ async fn http_tunnel(
         .instrument(tracing::error_span!("Tunnel", kind = "http", %subdomain)),
     );
 
+    debug!("HTTP tunnel finished");
+
     Ok(res)
 }
 
@@ -171,6 +173,8 @@ async fn tcp_tunnel(
         .instrument(tracing::error_span!("Tunnel", kind = "tcp", %port)),
     );
 
+    debug!("TCP tunnel finished");
+
     Ok(res)
 }
 
@@ -237,6 +241,8 @@ async fn tcp_proxy_tunnel(
         .instrument(tracing::error_span!("Tunnel", kind = "tcp", %port)),
     );
 
+    debug!("TCP proxy tunnel finished");
+
     Ok(res)
 }
 
@@ -285,6 +291,8 @@ async fn start_api(
         }))
         .await?;
 
+    debug!("API finished");
+
     Ok(())
 }
 
@@ -324,6 +332,8 @@ async fn start_metadata_api(
             }
         }))
         .await?;
+
+    debug!("Metadata API finished");
 
     Ok(())
 }
@@ -383,6 +393,8 @@ async fn start_http_proxy(
         });
     }
 
+    debug!("HTTP proxy finished");
+
     Ok(())
 }
 
@@ -400,6 +412,7 @@ async fn start_tcp_proxy(
             let port = match parse_proxy_protocol(&mut stream).await {
                 Ok(port) => TunnelName::PortNumber(port),
                 Err(err) => {
+                    debug!(error = err, "Could't parse proxy protocol message");
                     stream.shutdown().await?;
                     return Err(err);
                 }
@@ -424,6 +437,8 @@ async fn start_tcp_proxy(
             Ok::<_, Box<dyn Error + Send + Sync>>(())
         });
     }
+
+    debug!("TCP proxy finished");
 
     Ok(())
 }

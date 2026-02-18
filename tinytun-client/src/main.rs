@@ -1,4 +1,4 @@
-use std::{env, error::Error, time::Duration};
+use std::{env, error::Error, process::exit, time::Duration};
 
 use clap::{Parser, ValueEnum};
 use http::Uri;
@@ -115,11 +115,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     select! {
         _ = interrupt => {
             eprintln!("Exiting...");
+            exit(0)
         },
         _ = proxy => {
-            println!("Server is down");
+            eprintln!("Server is down");
+            exit(1)
         },
-    };
-
-    Ok(())
+    }
 }

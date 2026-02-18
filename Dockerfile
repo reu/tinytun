@@ -5,7 +5,7 @@ RUN mkdir /app
 WORKDIR /app
 RUN cargo new --lib tinytun
 RUN cargo new --lib tinytun-client
-RUN cargo new --bin tinytun-server
+RUN cargo new --bin tinytun-server && mkdir -p tinytun-server/src && echo "" > tinytun-server/src/lib.rs
 COPY Cargo.toml /app/
 COPY Cargo.lock /app/
 COPY tinytun/Cargo.toml /app/tinytun/
@@ -15,7 +15,7 @@ RUN cargo build --release --package tinytun-server
 COPY tinytun/src /app/tinytun/src
 COPY tinytun-server/src /app/tinytun-server/src
 RUN touch tinytun/src/lib.rs
-RUN touch tinytun-server/src/main.rs
+RUN touch tinytun-server/src/main.rs tinytun-server/src/lib.rs
 RUN cargo build --release --package tinytun-server
 
 FROM debian:buster-slim

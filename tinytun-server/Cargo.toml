@@ -3,6 +3,14 @@ name = "tinytun-server"
 version = "0.2.0"
 edition = "2021"
 
+[lib]
+name = "tinytun_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tinytun-server"
+path = "src/main.rs"
+
 [dependencies]
 bytes = "1.4.0"
 dashmap = "5.4.0"

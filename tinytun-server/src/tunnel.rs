@@ -19,6 +19,7 @@ use tinytun::TunnelStream;
 use tokio::{
     io::{self, AsyncRead, AsyncWrite},
     net::TcpStream,
+    time::{timeout, Duration},
 };
 use tracing::instrument;
 use uuid::Uuid;
@@ -33,9 +34,13 @@ pub struct Tunnel {
 impl Tunnel {
     #[instrument(skip(self, stream))]
     pub async fn tunnel(&self, mut stream: TcpStream) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let mut client = self.client.clone().ready().await?;
+        let mut client = timeout(Duration::from_secs(5), self.client.clone().ready())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "H2 stream not ready"))??;
         let (res, send_stream) = client.send_request(Request::new(()), false)?;
-        let res = res.await?;
+        let res = timeout(Duration::from_secs(10), res)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "H2 send_request timed out"))??;
         let tunnel_stream = TunnelStream::new(res.into_body(), send_stream);
         let mut tunnel_stream = StreamMonitor {
             inner: tunnel_stream,

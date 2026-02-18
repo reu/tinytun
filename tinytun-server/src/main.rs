@@ -16,7 +16,7 @@ use hyper::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, ToSocketAddrs},
-    time::sleep,
+    time::{sleep, timeout},
     try_join,
 };
 
@@ -70,8 +70,16 @@ async fn http_tunnel(
                         loop {
                             sleep(Duration::from_secs(10)).await;
                             trace!("Sending ping");
-                            ping_pong.ping(h2::Ping::opaque()).await?;
-                            trace!("Received pong");
+                            match timeout(
+                                Duration::from_secs(15),
+                                ping_pong.ping(h2::Ping::opaque()),
+                            )
+                            .await
+                            {
+                                Ok(Ok(_)) => trace!("Received pong"),
+                                Ok(Err(err)) => return Err(err),
+                                Err(_) => return Err(h2::Reason::NO_ERROR.into()),
+                            }
                         }
                         Ok::<_, h2::Error>(())
                     }
@@ -150,8 +158,16 @@ async fn tcp_tunnel(
                         loop {
                             sleep(Duration::from_secs(10)).await;
                             trace!("Sending ping");
-                            ping_pong.ping(h2::Ping::opaque()).await?;
-                            trace!("Received pong");
+                            match timeout(
+                                Duration::from_secs(15),
+                                ping_pong.ping(h2::Ping::opaque()),
+                            )
+                            .await
+                            {
+                                Ok(Ok(_)) => trace!("Received pong"),
+                                Ok(Err(err)) => return Err(err),
+                                Err(_) => return Err(h2::Reason::NO_ERROR.into()),
+                            }
                         }
                         Ok::<_, h2::Error>(())
                     }
@@ -219,8 +235,16 @@ async fn tcp_proxy_tunnel(
                         loop {
                             sleep(Duration::from_secs(10)).await;
                             trace!("Sending ping");
-                            ping_pong.ping(h2::Ping::opaque()).await?;
-                            trace!("Received pong");
+                            match timeout(
+                                Duration::from_secs(15),
+                                ping_pong.ping(h2::Ping::opaque()),
+                            )
+                            .await
+                            {
+                                Ok(Ok(_)) => trace!("Received pong"),
+                                Ok(Err(err)) => return Err(err),
+                                Err(_) => return Err(h2::Reason::NO_ERROR.into()),
+                            }
                         }
                         Ok::<_, h2::Error>(())
                     }
@@ -348,7 +372,11 @@ async fn start_http_proxy(
     while let Ok((stream, _addr)) = listener.accept().await {
         let tuns = tuns.clone();
         tokio::spawn(async move {
-            let host = peek_host(&stream).await?;
+            let host = timeout(Duration::from_secs(5), peek_host(&stream))
+                .await
+                .map_err(|_| -> Box<dyn Error + Send + Sync> {
+                    "Timed out reading Host header".into()
+                })??;
 
             let subdomain = match host.split_once('.').map(|(tun_id, _)| tun_id) {
                 Some(id) => TunnelName::Subdomain(id.to_string()),

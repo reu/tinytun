@@ -388,11 +388,20 @@ pub async fn start_http_proxy(
                 let tuns = tuns.clone();
                 tokio::spawn(async move {
                     let result: Result<(), Box<dyn Error + Send + Sync>> = async {
-                        let host = timeout(Duration::from_secs(5), peek_host(&stream))
+                        let host = match timeout(Duration::from_secs(5), peek_host(&stream))
                             .await
-                            .map_err(|_| -> Box<dyn Error + Send + Sync> {
-                                "Timed out reading Host header".into()
-                            })??;
+                        {
+                            Ok(Ok(host)) => host,
+                            Ok(Err(err)) => {
+                                // Health checks connect and close without sending data
+                                debug!(error = %err, "HTTP connection closed early");
+                                return Ok(());
+                            }
+                            Err(_) => {
+                                debug!("HTTP connection timed out reading Host header");
+                                return Ok(());
+                            }
+                        };
 
                         let subdomain = match host.split_once('.').map(|(tun_id, _)| tun_id) {
                             Some(id) => TunnelName::Subdomain(id.to_string()),
@@ -459,7 +468,7 @@ pub async fn start_tcp_proxy(
     loop {
         match listener.accept().await {
             Ok((mut stream, _addr)) => {
-                debug!("TCP stream accepted");
+                trace!("TCP stream accepted");
                 let tuns = tuns.clone();
                 tokio::spawn(async move {
                     let result: Result<(), Box<dyn Error + Send + Sync>> = async {
@@ -471,12 +480,15 @@ pub async fn start_tcp_proxy(
                         {
                             Ok(Ok(port)) => TunnelName::PortNumber(port),
                             Ok(Err(err)) => {
-                                stream.shutdown().await?;
-                                return Err(err);
+                                // Health checks connect and close without sending proxy protocol
+                                debug!(error = %err, "TCP connection closed during proxy protocol parse");
+                                let _ = stream.shutdown().await;
+                                return Ok(());
                             }
                             Err(_) => {
-                                stream.shutdown().await?;
-                                return Err("Timed out reading proxy protocol".into());
+                                debug!("TCP connection timed out reading proxy protocol");
+                                let _ = stream.shutdown().await;
+                                return Ok(());
                             }
                         };
                         debug!(port = port.to_string(), "TCP port received");

@@ -18,7 +18,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-use tracing::{debug, info, trace, warn, Instrument};
+use tracing::{debug, error, info, trace, warn, Instrument};
 use tunnel::{Tunnel, TunnelName, Tunnels};
 
 pub mod tunnel;
@@ -382,68 +382,72 @@ pub async fn start_http_proxy(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     info!("HTTP proxy running on {}", listener.local_addr()?);
 
-    while let Ok((stream, _addr)) = listener.accept().await {
-        let tuns = tuns.clone();
-        tokio::spawn(async move {
-            let result: Result<(), Box<dyn Error + Send + Sync>> = async {
-                let host = timeout(Duration::from_secs(5), peek_host(&stream))
-                    .await
-                    .map_err(|_| -> Box<dyn Error + Send + Sync> {
-                        "Timed out reading Host header".into()
-                    })??;
+    loop {
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                let tuns = tuns.clone();
+                tokio::spawn(async move {
+                    let result: Result<(), Box<dyn Error + Send + Sync>> = async {
+                        let host = timeout(Duration::from_secs(5), peek_host(&stream))
+                            .await
+                            .map_err(|_| -> Box<dyn Error + Send + Sync> {
+                                "Timed out reading Host header".into()
+                            })??;
 
-                let subdomain = match host.split_once('.').map(|(tun_id, _)| tun_id) {
-                    Some(id) => TunnelName::Subdomain(id.to_string()),
-                    None => {
-                        HttpServer::new()
-                            .serve_connection(
-                                stream,
-                                service_fn(|_| async {
-                                    Response::builder()
-                                        .status(StatusCode::NOT_FOUND)
-                                        .body(Body::from("Tunnel not informed"))
-                                }),
-                            )
-                            .await?;
-                        return Ok(());
-                    }
-                };
+                        let subdomain = match host.split_once('.').map(|(tun_id, _)| tun_id) {
+                            Some(id) => TunnelName::Subdomain(id.to_string()),
+                            None => {
+                                HttpServer::new()
+                                    .serve_connection(
+                                        stream,
+                                        service_fn(|_| async {
+                                            Response::builder()
+                                                .status(StatusCode::NOT_FOUND)
+                                                .body(Body::from("Tunnel not informed"))
+                                        }),
+                                    )
+                                    .await?;
+                                return Ok(());
+                            }
+                        };
 
-                match tuns.tunnel_for_name(&subdomain).await {
-                    Some(tun) => {
-                        tun.tunnel(stream)
-                            .instrument(tracing::error_span!(
-                                "Tunneling",
-                                subdomain = subdomain.to_string()
-                            ))
-                            .await?;
+                        match tuns.tunnel_for_name(&subdomain).await {
+                            Some(tun) => {
+                                tun.tunnel(stream)
+                                    .instrument(tracing::error_span!(
+                                        "Tunneling",
+                                        subdomain = subdomain.to_string()
+                                    ))
+                                    .await?;
+                            }
+                            None => {
+                                HttpServer::new()
+                                    .serve_connection(
+                                        stream,
+                                        service_fn(|_| async {
+                                            Response::builder()
+                                                .status(StatusCode::NOT_FOUND)
+                                                .body(Body::from("Tunnel not found"))
+                                        }),
+                                    )
+                                    .await?;
+                            }
+                        };
+                        Ok(())
                     }
-                    None => {
-                        HttpServer::new()
-                            .serve_connection(
-                                stream,
-                                service_fn(|_| async {
-                                    Response::builder()
-                                        .status(StatusCode::NOT_FOUND)
-                                        .body(Body::from("Tunnel not found"))
-                                }),
-                            )
-                            .await?;
+                    .await;
+
+                    if let Err(err) = result {
+                        warn!(error = %err, "HTTP proxy error");
                     }
-                };
-                Ok(())
+                });
             }
-            .await;
-
-            if let Err(err) = result {
-                warn!(error = %err, "HTTP proxy error");
+            Err(err) => {
+                error!(error = %err, "HTTP proxy accept error, retrying");
+                sleep(Duration::from_millis(100)).await;
             }
-        });
+        }
     }
-
-    debug!("HTTP proxy finished");
-
-    Ok(())
 }
 
 pub async fn start_tcp_proxy(
@@ -452,48 +456,61 @@ pub async fn start_tcp_proxy(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     info!("TCP proxy running on {}", listener.local_addr()?);
 
-    while let Ok((mut stream, _addr)) = listener.accept().await {
-        debug!("TCP stream accepted");
-        let tuns = tuns.clone();
-        tokio::spawn(async move {
-            let result: Result<(), Box<dyn Error + Send + Sync>> = async {
-                let port = match parse_proxy_protocol(&mut stream).await {
-                    Ok(port) => TunnelName::PortNumber(port),
-                    Err(err) => {
-                        stream.shutdown().await?;
-                        return Err(err);
-                    }
-                };
-                debug!(port = port.to_string(), "TCP port received");
+    loop {
+        match listener.accept().await {
+            Ok((mut stream, _addr)) => {
+                debug!("TCP stream accepted");
+                let tuns = tuns.clone();
+                tokio::spawn(async move {
+                    let result: Result<(), Box<dyn Error + Send + Sync>> = async {
+                        let port = match timeout(
+                            Duration::from_secs(5),
+                            parse_proxy_protocol(&mut stream),
+                        )
+                        .await
+                        {
+                            Ok(Ok(port)) => TunnelName::PortNumber(port),
+                            Ok(Err(err)) => {
+                                stream.shutdown().await?;
+                                return Err(err);
+                            }
+                            Err(_) => {
+                                stream.shutdown().await?;
+                                return Err("Timed out reading proxy protocol".into());
+                            }
+                        };
+                        debug!(port = port.to_string(), "TCP port received");
 
-                match tuns.tunnel_for_name(&port).await {
-                    Some(tun) => {
-                        debug!(port = port.to_string(), "TCP tunnel found");
-                        tun.tunnel(stream)
-                            .instrument(tracing::error_span!(
-                                "TCP Tunneling",
-                                port = port.to_string()
-                            ))
-                            .await?;
+                        match tuns.tunnel_for_name(&port).await {
+                            Some(tun) => {
+                                debug!(port = port.to_string(), "TCP tunnel found");
+                                tun.tunnel(stream)
+                                    .instrument(tracing::error_span!(
+                                        "TCP Tunneling",
+                                        port = port.to_string()
+                                    ))
+                                    .await?;
+                            }
+                            None => {
+                                debug!(port = port.to_string(), "TCP stream not found");
+                                stream.shutdown().await?;
+                            }
+                        };
+                        Ok(())
                     }
-                    None => {
-                        debug!(port = port.to_string(), "TCP stream not found");
-                        stream.shutdown().await?;
-                    }
-                };
-                Ok(())
-            }
-            .await;
+                    .await;
 
-            if let Err(err) = result {
-                warn!(error = %err, "TCP proxy error");
+                    if let Err(err) = result {
+                        warn!(error = %err, "TCP proxy error");
+                    }
+                });
             }
-        });
+            Err(err) => {
+                error!(error = %err, "TCP proxy accept error, retrying");
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
     }
-
-    debug!("TCP proxy finished");
-
-    Ok(())
 }
 
 pub async fn peek_host(stream: &TcpStream) -> Result<String, Box<dyn Error + Send + Sync>> {

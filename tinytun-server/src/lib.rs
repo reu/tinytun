@@ -407,6 +407,7 @@ pub async fn start_http_proxy(
                             Some(id) => TunnelName::Subdomain(id.to_string()),
                             None => {
                                 HttpServer::new()
+                                    .http1_keep_alive(false)
                                     .serve_connection(
                                         stream,
                                         service_fn(|_| async {
@@ -431,6 +432,7 @@ pub async fn start_http_proxy(
                             }
                             None => {
                                 HttpServer::new()
+                                    .http1_keep_alive(false)
                                     .serve_connection(
                                         stream,
                                         service_fn(|_| async {

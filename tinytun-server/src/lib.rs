@@ -529,19 +529,26 @@ pub async fn start_tcp_proxy(
 }
 
 pub async fn peek_host(stream: &TcpStream) -> Result<String, Box<dyn Error + Send + Sync>> {
-    let mut buf = vec![0; 1024];
+    let mut buf = vec![0; 4096];
+    let mut last_peeked = 0;
     loop {
         let peeked = stream.peek(&mut buf).await?;
         if peeked == 0 {
             return Err("Empty stream".into());
         }
-        let mut cursor = Cursor::new(&buf);
+        if peeked == last_peeked {
+            // No new data since last peek, sleep to prevent busy-looping
+            sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+        last_peeked = peeked;
+        let mut cursor = Cursor::new(&buf[..peeked]);
         if cursor.read_line(&mut String::with_capacity(peeked / 2))? == 0 {
             continue;
         }
-        let position = cursor.position().try_into()?;
+        let position = cursor.position() as usize;
         let mut headers = [httparse::EMPTY_HEADER; 16];
-        httparse::parse_headers(&buf[position..], &mut headers)?;
+        httparse::parse_headers(&buf[position..peeked], &mut headers)?;
 
         let host = headers
             .iter()

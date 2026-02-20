@@ -10,7 +10,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use hyper::Request;
 use pin_project_lite::pin_project;
 use rand::Rng;
@@ -118,11 +118,10 @@ impl Tunnels {
         let tun_id = TunnelId::new();
         let name = TunnelName::Subdomain(name.unwrap_or_else(|| tun_id.to_string()));
 
-        if self.names.contains_key(&name) {
-            return Err("Name already in use".into());
-        }
-
-        self.names.insert(name.clone(), tun_id);
+        match self.names.entry(name.clone()) {
+            Entry::Occupied(_) => return Err("Name already in use".into()),
+            Entry::Vacant(entry) => entry.insert(tun_id),
+        };
 
         Ok(TunnelEntry {
             tun_id,
@@ -132,20 +131,24 @@ impl Tunnels {
         })
     }
 
-    fn resolve_port(&self, port: Option<u16>) -> Result<(TunnelName, u16), Box<dyn Error + Send + Sync>> {
+    fn reserve_port(&self, port: Option<u16>, tun_id: TunnelId) -> Result<(TunnelName, u16), Box<dyn Error + Send + Sync>> {
         match port {
             Some(port) => {
                 let name = TunnelName::PortNumber(port);
-                if self.names.contains_key(&name) {
-                    return Err("Port already in use".into());
+                match self.names.entry(name.clone()) {
+                    Entry::Occupied(_) => Err("Port already in use".into()),
+                    Entry::Vacant(entry) => {
+                        entry.insert(tun_id);
+                        Ok((name, port))
+                    }
                 }
-                Ok((name, port))
             }
             None => {
                 for _ in 0..100 {
                     let port = rand::thread_rng().gen_range(20_000..60_000);
                     let name = TunnelName::PortNumber(port);
-                    if !self.names.contains_key(&name) {
+                    if let Entry::Vacant(entry) = self.names.entry(name.clone()) {
+                        entry.insert(tun_id);
                         return Ok((name, port));
                     }
                 }
@@ -159,9 +162,7 @@ impl Tunnels {
         port: Option<u16>,
     ) -> Result<(TunnelEntry, u16), Box<dyn Error + Send + Sync>> {
         let tun_id = TunnelId::new();
-        let (name, port) = self.resolve_port(port)?;
-
-        self.names.insert(name.clone(), tun_id);
+        let (name, port) = self.reserve_port(port, tun_id)?;
 
         Ok((
             TunnelEntry {
@@ -179,9 +180,7 @@ impl Tunnels {
         port: Option<u16>,
     ) -> Result<(TunnelId, u16), Box<dyn Error + Send + Sync>> {
         let tun_id = TunnelId::new();
-        let (name, port) = self.resolve_port(port)?;
-
-        self.names.insert(name.clone(), tun_id);
+        let (_, port) = self.reserve_port(port, tun_id)?;
 
         Ok((tun_id, port))
     }

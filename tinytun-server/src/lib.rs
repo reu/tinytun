@@ -317,11 +317,17 @@ pub async fn start_metadata_api(
                                 let tunnels =
                                     tuns.list_tunnels_metadata().await.collect::<Vec<_>>();
 
-                                let tunnels = serde_json::to_vec(&tunnels).unwrap();
-
-                                Response::builder()
-                                    .status(StatusCode::OK)
-                                    .body(Body::from(tunnels))
+                                match serde_json::to_vec(&tunnels) {
+                                    Ok(body) => Response::builder()
+                                        .status(StatusCode::OK)
+                                        .body(Body::from(body)),
+                                    Err(err) => {
+                                        error!(error = %err, "Failed to serialize tunnel metadata");
+                                        Response::builder()
+                                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                            .body(Body::empty())
+                                    }
+                                }
                             }
 
                             _ => Response::builder()

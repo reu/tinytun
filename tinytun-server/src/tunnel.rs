@@ -132,29 +132,34 @@ impl Tunnels {
         })
     }
 
+    fn resolve_port(&self, port: Option<u16>) -> Result<(TunnelName, u16), Box<dyn Error + Send + Sync>> {
+        match port {
+            Some(port) => {
+                let name = TunnelName::PortNumber(port);
+                if self.names.contains_key(&name) {
+                    return Err("Port already in use".into());
+                }
+                Ok((name, port))
+            }
+            None => {
+                for _ in 0..100 {
+                    let port = rand::thread_rng().gen_range(20_000..60_000);
+                    let name = TunnelName::PortNumber(port);
+                    if !self.names.contains_key(&name) {
+                        return Ok((name, port));
+                    }
+                }
+                Err("No available port found after 100 attempts".into())
+            }
+        }
+    }
+
     pub async fn new_tcp_proxy_tunnel(
         self: &Arc<Self>,
         port: Option<u16>,
     ) -> Result<(TunnelEntry, u16), Box<dyn Error + Send + Sync>> {
         let tun_id = TunnelId::new();
-
-        let (name, port) = match port {
-            Some(port) => {
-                let name = TunnelName::PortNumber(port);
-                if !self.names.contains_key(&name) {
-                    (name, port)
-                } else {
-                    return Err("Port already in use".into());
-                }
-            }
-            None => loop {
-                let port = rand::thread_rng().gen_range(20_000..60_000);
-                let name = TunnelName::PortNumber(port);
-                if !self.names.contains_key(&name) {
-                    break (name, port);
-                }
-            },
-        };
+        let (name, port) = self.resolve_port(port)?;
 
         self.names.insert(name.clone(), tun_id);
 
@@ -174,24 +179,7 @@ impl Tunnels {
         port: Option<u16>,
     ) -> Result<(TunnelId, u16), Box<dyn Error + Send + Sync>> {
         let tun_id = TunnelId::new();
-
-        let (name, port) = match port {
-            Some(port) => {
-                let name = TunnelName::PortNumber(port);
-                if !self.names.contains_key(&name) {
-                    (name, port)
-                } else {
-                    return Err("Port already in use".into());
-                }
-            }
-            None => loop {
-                let port = rand::thread_rng().gen_range(20_000..60_000);
-                let name = TunnelName::PortNumber(port);
-                if !self.names.contains_key(&name) {
-                    break (name, port);
-                }
-            },
-        };
+        let (name, port) = self.resolve_port(port)?;
 
         self.names.insert(name.clone(), tun_id);
 

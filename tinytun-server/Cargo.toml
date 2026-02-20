@@ -20,6 +20,7 @@ hyper = { version = "0.14.23", features = ["full"] }
 pin-project-lite = "0.2.9"
 rand = "0.8.5"
 serde = { version = "1.0.160", features = ["derive"] }
+thiserror = "1"
 serde_json = "1.0.96"
 tinytun = { path = "../tinytun" }
 tokio = { version = "1.25.0", features = ["full"] }

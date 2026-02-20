@@ -1,5 +1,4 @@
 use std::{
-    error::Error,
     fmt::Display,
     pin::Pin,
     sync::{
@@ -21,8 +20,27 @@ use tokio::{
     net::TcpStream,
     time::{timeout, Duration},
 };
+use thiserror::Error;
 use tracing::instrument;
 use uuid::Uuid;
+
+#[derive(Debug, Error)]
+pub enum RegistryError {
+    #[error("subdomain already in use")]
+    SubdomainConflict,
+    #[error("port already in use: {0}")]
+    PortConflict(u16),
+    #[error("no available port found after 100 attempts")]
+    PortExhausted,
+}
+
+#[derive(Debug, Error)]
+pub enum TunnelError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    H2(#[from] h2::Error),
+}
 
 #[derive(Debug, Clone)]
 pub struct Tunnel {
@@ -33,7 +51,7 @@ pub struct Tunnel {
 
 impl Tunnel {
     #[instrument(skip(self, stream))]
-    pub async fn tunnel(&self, mut stream: TcpStream) -> Result<(), Box<dyn Error + Send + Sync>> {
+    pub async fn tunnel(&self, mut stream: TcpStream) -> Result<(), TunnelError> {
         let mut client = timeout(Duration::from_secs(5), self.client.clone().ready())
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "H2 stream not ready"))??;
@@ -114,12 +132,12 @@ impl Tunnels {
     pub async fn new_http_tunnel(
         self: &Arc<Self>,
         name: Option<String>,
-    ) -> Result<TunnelEntry, Box<dyn Error + Send + Sync>> {
+    ) -> Result<TunnelEntry, RegistryError> {
         let tun_id = TunnelId::new();
         let name = TunnelName::Subdomain(name.unwrap_or_else(|| tun_id.to_string()));
 
         match self.names.entry(name.clone()) {
-            Entry::Occupied(_) => return Err("Name already in use".into()),
+            Entry::Occupied(_) => return Err(RegistryError::SubdomainConflict),
             Entry::Vacant(entry) => entry.insert(tun_id),
         };
 
@@ -131,12 +149,12 @@ impl Tunnels {
         })
     }
 
-    fn reserve_port(&self, port: Option<u16>, tun_id: TunnelId) -> Result<(TunnelName, u16), Box<dyn Error + Send + Sync>> {
+    fn reserve_port(&self, port: Option<u16>, tun_id: TunnelId) -> Result<(TunnelName, u16), RegistryError> {
         match port {
             Some(port) => {
                 let name = TunnelName::PortNumber(port);
                 match self.names.entry(name.clone()) {
-                    Entry::Occupied(_) => Err("Port already in use".into()),
+                    Entry::Occupied(_) => Err(RegistryError::PortConflict(port)),
                     Entry::Vacant(entry) => {
                         entry.insert(tun_id);
                         Ok((name, port))
@@ -152,7 +170,7 @@ impl Tunnels {
                         return Ok((name, port));
                     }
                 }
-                Err("No available port found after 100 attempts".into())
+                Err(RegistryError::PortExhausted)
             }
         }
     }
@@ -160,7 +178,7 @@ impl Tunnels {
     pub async fn new_tcp_proxy_tunnel(
         self: &Arc<Self>,
         port: Option<u16>,
-    ) -> Result<(TunnelEntry, u16), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(TunnelEntry, u16), RegistryError> {
         let tun_id = TunnelId::new();
         let (name, port) = self.reserve_port(port, tun_id)?;
 
@@ -178,7 +196,7 @@ impl Tunnels {
     pub async fn new_tcp_tunnel(
         self: &Arc<Self>,
         port: Option<u16>,
-    ) -> Result<(TunnelId, u16), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(TunnelId, u16), RegistryError> {
         let tun_id = TunnelId::new();
         let (_, port) = self.reserve_port(port, tun_id)?;
 

@@ -23,6 +23,18 @@ use tunnel::{Tunnel, TunnelName, Tunnels};
 
 pub mod tunnel;
 
+async fn ping_loop(mut ping_pong: h2::PingPong) -> Result<(), h2::Error> {
+    loop {
+        sleep(Duration::from_secs(10)).await;
+        trace!("Sending ping");
+        match timeout(Duration::from_secs(15), ping_pong.ping(h2::Ping::opaque())).await {
+            Ok(Ok(_)) => trace!("Received pong"),
+            Ok(Err(err)) => return Err(err),
+            Err(_) => return Err(h2::Reason::NO_ERROR.into()),
+        }
+    }
+}
+
 pub async fn http_tunnel(
     base_domain: &str,
     tuns: Arc<Tunnels>,
@@ -63,27 +75,7 @@ pub async fn http_tunnel(
                         Ok((client, mut h2)) => {
                             tun_entry.add_tunnel(client.into()).await;
 
-                            let mut ping_pong = h2.ping_pong().unwrap();
-                            #[allow(unreachable_code)]
-                            let ping = async move {
-                                loop {
-                                    sleep(Duration::from_secs(10)).await;
-                                    trace!("Sending ping");
-                                    match timeout(
-                                        Duration::from_secs(15),
-                                        ping_pong.ping(h2::Ping::opaque()),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(_)) => trace!("Received pong"),
-                                        Ok(Err(err)) => return Err(err),
-                                        Err(_) => return Err(h2::Reason::NO_ERROR.into()),
-                                    }
-                                }
-                                Ok::<_, h2::Error>(())
-                            }
-                            .in_current_span();
-
+                            let ping = ping_loop(h2.ping_pong().unwrap()).in_current_span();
                             if let Err(err) = tokio::select! {
                                 result = h2 => result,
                                 result = ping => result,
@@ -158,26 +150,7 @@ pub async fn tcp_tunnel(
                                 Ok::<_, h2::Error>(())
                             };
 
-                            let mut ping_pong = h2.ping_pong().unwrap();
-                            #[allow(unreachable_code)]
-                            let ping = async move {
-                                loop {
-                                    sleep(Duration::from_secs(10)).await;
-                                    trace!("Sending ping");
-                                    match timeout(
-                                        Duration::from_secs(15),
-                                        ping_pong.ping(h2::Ping::opaque()),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(_)) => trace!("Received pong"),
-                                        Ok(Err(err)) => return Err(err),
-                                        Err(_) => return Err(h2::Reason::NO_ERROR.into()),
-                                    }
-                                }
-                                Ok::<_, h2::Error>(())
-                            }
-                            .in_current_span();
+                            let ping = ping_loop(h2.ping_pong().unwrap()).in_current_span();
 
                             if let Err(err) = tokio::select! {
                                 result = h2 => result,
@@ -241,26 +214,7 @@ pub async fn tcp_proxy_tunnel(
                         Ok((client, mut h2)) => {
                             tun_entry.add_tunnel(client.into()).await;
 
-                            let mut ping_pong = h2.ping_pong().unwrap();
-                            #[allow(unreachable_code)]
-                            let ping = async move {
-                                loop {
-                                    sleep(Duration::from_secs(10)).await;
-                                    trace!("Sending ping");
-                                    match timeout(
-                                        Duration::from_secs(15),
-                                        ping_pong.ping(h2::Ping::opaque()),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(_)) => trace!("Received pong"),
-                                        Ok(Err(err)) => return Err(err),
-                                        Err(_) => return Err(h2::Reason::NO_ERROR.into()),
-                                    }
-                                }
-                                Ok::<_, h2::Error>(())
-                            }
-                            .in_current_span();
+                            let ping = ping_loop(h2.ping_pong().unwrap()).in_current_span();
 
                             if let Err(err) = tokio::select! {
                                 result = h2 => result,

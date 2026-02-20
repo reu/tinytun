@@ -1,7 +1,10 @@
 [package]
 name = "tinytun-server"
-version = "0.2.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 name = "tinytun_server"

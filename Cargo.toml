@@ -5,3 +5,14 @@ members = [
   "./tinytun-client",
   "./tinytun-server",
 ]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+authors = ["Rodrigo Navarro <rnavarro@rnavarro.com.br>"]
+description = "Expose local web servers on the internet"
+categories = ["network-programming", "asynchronous"]
+keywords = ["web", "tunnel", "proxy"]
+documentation = "https://docs.rs/tinytun"
+repository = "https://github.com/reu/tinytun"

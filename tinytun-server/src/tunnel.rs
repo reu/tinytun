@@ -42,6 +42,11 @@ pub enum TunnelError {
     H2(#[from] h2::Error),
 }
 
+const CLIENT_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const SEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const PORT_RANGE: std::ops::Range<u16> = 20_000..60_000;
+const MAX_PORT_RETRIES: usize = 100;
+
 #[derive(Debug, Clone)]
 pub struct Tunnel {
     client: h2::client::SendRequest<Bytes>,
@@ -52,11 +57,11 @@ pub struct Tunnel {
 impl Tunnel {
     #[instrument(skip(self, stream))]
     pub async fn tunnel(&self, mut stream: TcpStream) -> Result<(), TunnelError> {
-        let mut client = timeout(Duration::from_secs(5), self.client.clone().ready())
+        let mut client = timeout(CLIENT_READY_TIMEOUT, self.client.clone().ready())
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "H2 stream not ready"))??;
         let (res, send_stream) = client.send_request(Request::new(()), false)?;
-        let res = timeout(Duration::from_secs(10), res)
+        let res = timeout(SEND_REQUEST_TIMEOUT, res)
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "H2 send_request timed out"))??;
         let tunnel_stream = TunnelStream::new(res.into_body(), send_stream);
@@ -162,8 +167,8 @@ impl Tunnels {
                 }
             }
             None => {
-                for _ in 0..100 {
-                    let port = rand::thread_rng().gen_range(20_000..60_000);
+                for _ in 0..MAX_PORT_RETRIES {
+                    let port = rand::thread_rng().gen_range(PORT_RANGE);
                     let name = TunnelName::PortNumber(port);
                     if let Entry::Vacant(entry) = self.names.entry(name.clone()) {
                         entry.insert(tun_id);

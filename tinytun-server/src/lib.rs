@@ -23,11 +23,19 @@ use tunnel::{Tunnel, TunnelName, Tunnels};
 
 pub mod tunnel;
 
+const PING_INTERVAL: Duration = Duration::from_secs(10);
+const PING_TIMEOUT: Duration = Duration::from_secs(15);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const PEEK_BUF_SIZE: usize = 4096;
+const MAX_PEEK_HEADERS: usize = 16;
+const PEEK_RETRY_DELAY: Duration = Duration::from_millis(50);
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
 async fn ping_loop(mut ping_pong: h2::PingPong) -> Result<(), h2::Error> {
     loop {
-        sleep(Duration::from_secs(10)).await;
+        sleep(PING_INTERVAL).await;
         trace!("Sending ping");
-        match timeout(Duration::from_secs(15), ping_pong.ping(h2::Ping::opaque())).await {
+        match timeout(PING_TIMEOUT, ping_pong.ping(h2::Ping::opaque())).await {
             Ok(Ok(_)) => trace!("Received pong"),
             Ok(Err(err)) => return Err(err),
             Err(_) => return Err(h2::Reason::NO_ERROR.into()),
@@ -343,7 +351,7 @@ pub async fn start_http_proxy(
                 let tuns = tuns.clone();
                 tokio::spawn(async move {
                     let result: Result<(), Box<dyn Error + Send + Sync>> = async {
-                        let host = match timeout(Duration::from_secs(5), peek_host(&stream))
+                        let host = match timeout(HANDSHAKE_TIMEOUT, peek_host(&stream))
                             .await
                         {
                             Ok(Ok(host)) => host,
@@ -410,7 +418,7 @@ pub async fn start_http_proxy(
             }
             Err(err) => {
                 error!(error = %err, "HTTP proxy accept error, retrying");
-                sleep(Duration::from_millis(100)).await;
+                sleep(ACCEPT_ERROR_BACKOFF).await;
             }
         }
     }
@@ -430,7 +438,7 @@ pub async fn start_tcp_proxy(
                 tokio::spawn(async move {
                     let result: Result<(), Box<dyn Error + Send + Sync>> = async {
                         let port = match timeout(
-                            Duration::from_secs(5),
+                            HANDSHAKE_TIMEOUT,
                             parse_proxy_protocol(&mut stream),
                         )
                         .await
@@ -476,14 +484,14 @@ pub async fn start_tcp_proxy(
             }
             Err(err) => {
                 error!(error = %err, "TCP proxy accept error, retrying");
-                sleep(Duration::from_millis(100)).await;
+                sleep(ACCEPT_ERROR_BACKOFF).await;
             }
         }
     }
 }
 
 pub async fn peek_host(stream: &TcpStream) -> Result<String, Box<dyn Error + Send + Sync>> {
-    let mut buf = vec![0; 4096];
+    let mut buf = vec![0; PEEK_BUF_SIZE];
     let mut last_peeked = 0;
     loop {
         let peeked = stream.peek(&mut buf).await?;
@@ -492,7 +500,7 @@ pub async fn peek_host(stream: &TcpStream) -> Result<String, Box<dyn Error + Sen
         }
         if peeked == last_peeked {
             // No new data since last peek, sleep to prevent busy-looping
-            sleep(Duration::from_millis(50)).await;
+            sleep(PEEK_RETRY_DELAY).await;
             continue;
         }
         last_peeked = peeked;
@@ -501,7 +509,7 @@ pub async fn peek_host(stream: &TcpStream) -> Result<String, Box<dyn Error + Sen
             continue;
         }
         let position = cursor.position() as usize;
-        let mut headers = [httparse::EMPTY_HEADER; 16];
+        let mut headers = [httparse::EMPTY_HEADER; MAX_PEEK_HEADERS];
         httparse::parse_headers(&buf[position..peeked], &mut headers)?;
 
         let host = headers

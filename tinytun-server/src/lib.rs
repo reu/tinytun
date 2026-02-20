@@ -314,8 +314,7 @@ pub async fn start_metadata_api(
                     async move {
                         match req.uri().path().split('/').collect::<Vec<_>>().as_slice() {
                             ["", "tunnels"] => {
-                                let tunnels =
-                                    tuns.list_tunnels_metadata().await.collect::<Vec<_>>();
+                                let tunnels = tuns.list_tunnels_metadata().await;
 
                                 match serde_json::to_vec(&tunnels) {
                                     Ok(body) => Response::builder()

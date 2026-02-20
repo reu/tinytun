@@ -1,15 +1,15 @@
 use std::{
+    collections::HashMap,
     fmt::Display,
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, RwLock,
     },
     task::{self, ready},
 };
 
 use bytes::Bytes;
-use dashmap::{mapref::entry::Entry, DashMap};
 use hyper::Request;
 use pin_project_lite::pin_project;
 use rand::Rng;
@@ -121,16 +121,22 @@ impl Display for TunnelName {
     }
 }
 
+struct Registry {
+    tunnels: HashMap<TunnelId, (Tunnel, TunnelName)>,
+    names: HashMap<TunnelName, TunnelId>,
+}
+
 pub struct Tunnels {
-    tunnels: DashMap<TunnelId, (Tunnel, TunnelName)>,
-    names: DashMap<TunnelName, TunnelId>,
+    registry: RwLock<Registry>,
 }
 
 impl Tunnels {
     pub fn new() -> Self {
         Self {
-            tunnels: DashMap::new(),
-            names: DashMap::new(),
+            registry: RwLock::new(Registry {
+                tunnels: HashMap::new(),
+                names: HashMap::new(),
+            }),
         }
     }
 
@@ -141,10 +147,13 @@ impl Tunnels {
         let tun_id = TunnelId::new();
         let name = TunnelName::Subdomain(name.unwrap_or_else(|| tun_id.to_string()));
 
-        match self.names.entry(name.clone()) {
-            Entry::Occupied(_) => return Err(RegistryError::SubdomainConflict),
-            Entry::Vacant(entry) => entry.insert(tun_id),
-        };
+        {
+            let mut reg = self.registry.write().unwrap_or_else(|e| e.into_inner());
+            if reg.names.contains_key(&name) {
+                return Err(RegistryError::SubdomainConflict);
+            }
+            reg.names.insert(name.clone(), tun_id);
+        }
 
         Ok(TunnelEntry {
             tun_id,
@@ -155,23 +164,23 @@ impl Tunnels {
     }
 
     fn reserve_port(&self, port: Option<u16>, tun_id: TunnelId) -> Result<(TunnelName, u16), RegistryError> {
+        let mut reg = self.registry.write().unwrap_or_else(|e| e.into_inner());
         match port {
             Some(port) => {
                 let name = TunnelName::PortNumber(port);
-                match self.names.entry(name.clone()) {
-                    Entry::Occupied(_) => Err(RegistryError::PortConflict(port)),
-                    Entry::Vacant(entry) => {
-                        entry.insert(tun_id);
-                        Ok((name, port))
-                    }
+                if reg.names.contains_key(&name) {
+                    Err(RegistryError::PortConflict(port))
+                } else {
+                    reg.names.insert(name.clone(), tun_id);
+                    Ok((name, port))
                 }
             }
             None => {
                 for _ in 0..MAX_PORT_RETRIES {
                     let port = rand::thread_rng().gen_range(PORT_RANGE);
                     let name = TunnelName::PortNumber(port);
-                    if let Entry::Vacant(entry) = self.names.entry(name.clone()) {
-                        entry.insert(tun_id);
+                    if !reg.names.contains_key(&name) {
+                        reg.names.insert(name.clone(), tun_id);
                         return Ok((name, port));
                     }
                 }
@@ -209,26 +218,29 @@ impl Tunnels {
     }
 
     pub async fn tunnel_for_name(&self, name: &TunnelName) -> Option<Tunnel> {
-        let tun_id = self.names.get(name)?;
-        self.tunnels.get(&tun_id).map(|tun| tun.value().0.clone())
+        let reg = self.registry.read().unwrap_or_else(|e| e.into_inner());
+        let tun_id = reg.names.get(name)?;
+        reg.tunnels.get(tun_id).map(|(tun, _)| tun.clone())
     }
 
     pub async fn remove_tunnel(&self, tun_id: TunnelId) {
-        if let Some((_, (_, name))) = self.tunnels.remove(&tun_id) {
-            self.names.remove(&name);
+        let mut reg = self.registry.write().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, name)) = reg.tunnels.remove(&tun_id) {
+            reg.names.remove(&name);
         }
     }
 
-    pub async fn list_tunnels_metadata(&self) -> impl Iterator<Item = TunnelMetadata> + '_ {
-        self.tunnels.iter().map(|item| {
-            let (tunnel, name) = item.value();
-            TunnelMetadata {
-                id: *item.key(),
+    pub async fn list_tunnels_metadata(&self) -> Vec<TunnelMetadata> {
+        let reg = self.registry.read().unwrap_or_else(|e| e.into_inner());
+        reg.tunnels
+            .iter()
+            .map(|(id, (tunnel, name))| TunnelMetadata {
+                id: *id,
                 name: name.clone(),
                 read_bytes: tunnel.read_bytes.load(Ordering::Relaxed),
                 written_bytes: tunnel.written_bytes.load(Ordering::Relaxed),
-            }
-        })
+            })
+            .collect()
     }
 }
 
@@ -257,9 +269,8 @@ impl TunnelEntry {
     }
 
     pub async fn add_tunnel(&mut self, tunnel: Tunnel) {
-        self.registry
-            .tunnels
-            .insert(self.tun_id, (tunnel.clone(), self.name.clone()));
+        let mut reg = self.registry.registry.write().unwrap_or_else(|e| e.into_inner());
+        reg.tunnels.insert(self.tun_id, (tunnel, self.name.clone()));
         self.persisted = true;
     }
 }
@@ -267,9 +278,8 @@ impl TunnelEntry {
 impl Drop for TunnelEntry {
     fn drop(&mut self) {
         if !self.persisted {
-            let subdomain = self.name.clone();
-            let tunnels = self.registry.clone();
-            tunnels.names.remove(&subdomain);
+            let mut reg = self.registry.registry.write().unwrap_or_else(|e| e.into_inner());
+            reg.names.remove(&self.name);
         }
     }
 }

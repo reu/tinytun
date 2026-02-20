@@ -308,6 +308,7 @@ pub async fn start_api(
                             return Ok::<_, Box<dyn Error + Send + Sync>>(
                                 Response::builder()
                                     .status(StatusCode::OK)
+                                    .header(header::CONNECTION, "close")
                                     .body(Body::empty())?,
                             );
                         }

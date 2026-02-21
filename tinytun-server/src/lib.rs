@@ -19,7 +19,7 @@ use tokio::{
 };
 
 use tracing::{debug, error, info, trace, warn, Instrument};
-use tunnel::{Tunnel, TunnelName, Tunnels};
+use tunnel::{PeerResolver, Tunnel, TunnelName, Tunnels};
 
 pub mod tunnel;
 
@@ -43,9 +43,9 @@ async fn ping_loop(mut ping_pong: h2::PingPong) -> Result<(), h2::Error> {
     }
 }
 
-pub async fn http_tunnel(
+pub async fn http_tunnel<R: PeerResolver + 'static>(
     base_domain: &str,
-    tuns: Arc<Tunnels>,
+    tuns: Arc<Tunnels<R>>,
     mut req: Request<Body>,
 ) -> Result<Response<Body>, Box<dyn Error + Send + Sync>> {
     let subdomain = req
@@ -108,8 +108,8 @@ pub async fn http_tunnel(
     Ok(res)
 }
 
-pub async fn tcp_tunnel(
-    tuns: Arc<Tunnels>,
+pub async fn tcp_tunnel<R: PeerResolver + 'static>(
+    tuns: Arc<Tunnels<R>>,
     mut req: Request<Body>,
 ) -> Result<Response<Body>, Box<dyn Error + Send + Sync>> {
     let port = req
@@ -185,8 +185,8 @@ pub async fn tcp_tunnel(
     Ok(res)
 }
 
-pub async fn tcp_proxy_tunnel(
-    tuns: Arc<Tunnels>,
+pub async fn tcp_proxy_tunnel<R: PeerResolver + 'static>(
+    tuns: Arc<Tunnels<R>>,
     mut req: Request<Body>,
 ) -> Result<Response<Body>, Box<dyn Error + Send + Sync>> {
     let port = req
@@ -248,8 +248,8 @@ pub async fn tcp_proxy_tunnel(
     Ok(res)
 }
 
-pub async fn start_api(
-    tuns: Arc<Tunnels>,
+pub async fn start_api<R: PeerResolver + 'static>(
+    tuns: Arc<Tunnels<R>>,
     base_domain: Arc<String>,
     listener: TcpListener,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -298,8 +298,8 @@ pub async fn start_api(
     Ok(())
 }
 
-pub async fn start_metadata_api(
-    tuns: Arc<Tunnels>,
+pub async fn start_metadata_api<R: PeerResolver + 'static>(
+    tuns: Arc<Tunnels<R>>,
     listener: TcpListener,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     info!("Metadata API running on {}", listener.local_addr()?);
@@ -313,6 +313,30 @@ pub async fn start_metadata_api(
                     let tuns = tuns.clone();
                     async move {
                         match req.uri().path().split('/').collect::<Vec<_>>().as_slice() {
+                            ["", "tunnels", subdomain] => {
+                                match tuns
+                                    .list_tunnels_metadata()
+                                    .await
+                                    .iter()
+                                    .find(|tun| tun.name == **subdomain)
+                                {
+                                    Some(tun) => match serde_json::to_vec(tun) {
+                                        Ok(body) => Response::builder()
+                                            .status(StatusCode::OK)
+                                            .body(Body::from(body)),
+                                        Err(err) => {
+                                            error!(error = %err, "Failed to serialize tunnel metadata");
+                                            Response::builder()
+                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                .body(Body::empty())
+                                        }
+                                    }
+                                    None => Response::builder()
+                                        .status(StatusCode::NOT_FOUND)
+                                        .body(Body::empty()),
+                                }
+                            }
+
                             ["", "tunnels"] => {
                                 let tunnels = tuns.list_tunnels_metadata().await;
 
@@ -344,8 +368,8 @@ pub async fn start_metadata_api(
     Ok(())
 }
 
-pub async fn start_http_proxy(
-    tuns: Arc<Tunnels>,
+pub async fn start_http_proxy<R: PeerResolver + 'static>(
+    tuns: Arc<Tunnels<R>>,
     listener: TcpListener,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     info!("HTTP proxy running on {}", listener.local_addr()?);
@@ -427,8 +451,8 @@ pub async fn start_http_proxy(
     }
 }
 
-pub async fn start_tcp_proxy(
-    tuns: Arc<Tunnels>,
+pub async fn start_tcp_proxy<R: PeerResolver + 'static>(
+    tuns: Arc<Tunnels<R>>,
     listener: TcpListener,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     info!("TCP proxy running on {}", listener.local_addr()?);

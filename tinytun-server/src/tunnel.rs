@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fmt::Display,
+    net::SocketAddr,
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -10,7 +11,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use hyper::Request;
+use hyper::{Request, Uri};
 use pin_project_lite::pin_project;
 use rand::Rng;
 use serde::{Serialize, Serializer};
@@ -18,7 +19,7 @@ use thiserror::Error;
 use tinytun::TunnelStream;
 use tokio::{
     io::{self, AsyncRead, AsyncWrite},
-    net::TcpStream,
+    net::{self, TcpStream},
     time::{timeout, Duration},
 };
 use tracing::instrument;
@@ -47,9 +48,48 @@ const SEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const PORT_RANGE: std::ops::Range<u16> = 20_000..60_000;
 const MAX_PORT_RETRIES: usize = 100;
 
+pub trait PeerResolver: Send + Sync {
+    fn resolve(&self) -> impl std::future::Future<Output = Vec<SocketAddr>> + Send;
+}
+
+pub struct DnsPeerResolver {
+    hostname: String,
+    port: u16,
+}
+
+impl DnsPeerResolver {
+    pub fn new(hostname: impl Into<String>, port: u16) -> Self {
+        Self {
+            hostname: hostname.into(),
+            port,
+        }
+    }
+}
+
+impl PeerResolver for DnsPeerResolver {
+    async fn resolve(&self) -> Vec<SocketAddr> {
+        net::lookup_host((&*self.hostname, self.port))
+            .await
+            .map(|addrs| addrs.collect())
+            .unwrap_or_default()
+    }
+}
+
+impl PeerResolver for Vec<SocketAddr> {
+    async fn resolve(&self) -> Vec<SocketAddr> {
+        self.clone()
+    }
+}
+
+#[derive(Debug, Clone)]
+enum TunnelConnection {
+    Local(h2::client::SendRequest<Bytes>),
+    Remote(SocketAddr),
+}
+
 #[derive(Debug, Clone)]
 pub struct Tunnel {
-    client: h2::client::SendRequest<Bytes>,
+    connection: TunnelConnection,
     read_bytes: Arc<AtomicUsize>,
     written_bytes: Arc<AtomicUsize>,
 }
@@ -57,25 +97,36 @@ pub struct Tunnel {
 impl Tunnel {
     #[instrument(skip(self, stream))]
     pub async fn tunnel(&self, mut stream: TcpStream) -> Result<(), TunnelError> {
-        let mut client = timeout(CLIENT_READY_TIMEOUT, self.client.clone().ready())
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "H2 stream not ready"))??;
+        match self.connection {
+            TunnelConnection::Local(ref client) => {
+                let mut client = timeout(CLIENT_READY_TIMEOUT, client.clone().ready())
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "H2 stream not ready")
+                    })??;
 
-        let (res, send_stream) = client.send_request(Request::new(()), false)?;
+                let (res, send_stream) = client.send_request(Request::new(()), false)?;
 
-        let res = timeout(SEND_REQUEST_TIMEOUT, res)
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "H2 send_request timed out"))??;
+                let res = timeout(SEND_REQUEST_TIMEOUT, res).await.map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "H2 send_request timed out")
+                })??;
 
-        let tunnel_stream = TunnelStream::new(res.into_body(), send_stream);
+                let tunnel_stream = TunnelStream::new(res.into_body(), send_stream);
 
-        let mut tunnel_stream = StreamMonitor {
-            inner: tunnel_stream,
-            read_bytes: self.read_bytes.clone(),
-            written_bytes: self.written_bytes.clone(),
+                let mut tunnel_stream = StreamMonitor {
+                    inner: tunnel_stream,
+                    read_bytes: self.read_bytes.clone(),
+                    written_bytes: self.written_bytes.clone(),
+                };
+
+                io::copy_bidirectional(&mut stream, &mut tunnel_stream).await?;
+            }
+
+            TunnelConnection::Remote(addr) => {
+                let mut remote_stream = TcpStream::connect(addr).await?;
+                io::copy_bidirectional(&mut stream, &mut remote_stream).await?;
+            }
         };
-
-        io::copy_bidirectional(&mut stream, &mut tunnel_stream).await?;
         Ok(())
     }
 }
@@ -83,7 +134,17 @@ impl Tunnel {
 impl From<h2::client::SendRequest<Bytes>> for Tunnel {
     fn from(send_request: h2::client::SendRequest<Bytes>) -> Self {
         Tunnel {
-            client: send_request,
+            connection: TunnelConnection::Local(send_request),
+            read_bytes: Default::default(),
+            written_bytes: Default::default(),
+        }
+    }
+}
+
+impl From<SocketAddr> for Tunnel {
+    fn from(addr: SocketAddr) -> Self {
+        Tunnel {
+            connection: TunnelConnection::Remote(addr),
             read_bytes: Default::default(),
             written_bytes: Default::default(),
         }
@@ -123,6 +184,15 @@ pub enum TunnelName {
     PortNumber(u16),
 }
 
+impl PartialEq<str> for TunnelName {
+    fn eq(&self, other: &str) -> bool {
+        match self {
+            TunnelName::Subdomain(subdomain) => subdomain == other,
+            TunnelName::PortNumber(port) => other.parse::<u16>() == Ok(*port),
+        }
+    }
+}
+
 impl Display for TunnelName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -137,30 +207,52 @@ struct Registry {
     names: HashMap<TunnelName, TunnelId>,
 }
 
-pub struct Tunnels {
+pub struct Tunnels<R: PeerResolver> {
     registry: RwLock<Registry>,
+    peer_resolver: R,
+    http_proxy_port: u16,
+    tcp_proxy_port: u16,
 }
 
-impl Default for Tunnels {
+impl Default for Tunnels<Vec<SocketAddr>> {
     fn default() -> Self {
-        Self::new()
+        Self::new(vec![])
     }
 }
 
-impl Tunnels {
-    pub fn new() -> Self {
+impl<R: PeerResolver> Tunnels<R> {
+    pub fn new(peer_resolver: R) -> Self {
         Self {
             registry: RwLock::new(Registry {
                 tunnels: HashMap::new(),
                 names: HashMap::new(),
             }),
+            peer_resolver,
+            http_proxy_port: 5555,
+            tcp_proxy_port: 5556,
+        }
+    }
+
+    pub fn with_peer_proxy_ports(
+        peer_resolver: R,
+        http_proxy_port: u16,
+        tcp_proxy_port: u16,
+    ) -> Self {
+        Self {
+            registry: RwLock::new(Registry {
+                tunnels: HashMap::new(),
+                names: HashMap::new(),
+            }),
+            peer_resolver,
+            http_proxy_port,
+            tcp_proxy_port,
         }
     }
 
     pub async fn new_http_tunnel(
         self: &Arc<Self>,
         name: Option<String>,
-    ) -> Result<TunnelEntry, RegistryError> {
+    ) -> Result<TunnelEntry<R>, RegistryError> {
         let tun_id = TunnelId::new();
         let name = TunnelName::Subdomain(name.unwrap_or_else(|| tun_id.to_string()));
 
@@ -213,7 +305,7 @@ impl Tunnels {
     pub async fn new_tcp_proxy_tunnel(
         self: &Arc<Self>,
         port: Option<u16>,
-    ) -> Result<(TunnelEntry, u16), RegistryError> {
+    ) -> Result<(TunnelEntry<R>, u16), RegistryError> {
         let tun_id = TunnelId::new();
         let (name, port) = self.reserve_port(port, tun_id)?;
 
@@ -239,9 +331,34 @@ impl Tunnels {
     }
 
     pub async fn tunnel_for_name(&self, name: &TunnelName) -> Option<Tunnel> {
-        let reg = self.registry.read().unwrap_or_else(|e| e.into_inner());
-        let tun_id = reg.names.get(name)?;
-        reg.tunnels.get(tun_id).map(|(tun, _)| tun.clone())
+        {
+            let reg = self.registry.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(tun_id) = reg.names.get(name) {
+                if let Some(tun) = reg.tunnels.get(tun_id).map(|(tun, _)| tun.clone()) {
+                    return Some(tun);
+                }
+            }
+        }
+
+        let http = hyper::Client::new();
+        for server in self.peer_resolver.resolve().await {
+            tracing::trace!("Querying {server} for {name}");
+            match http
+                .get(Uri::try_from(format!("http://{server}/tunnels/{name}")).unwrap())
+                .await
+            {
+                Ok(res) if res.status().is_success() => {
+                    let proxy_port = match name {
+                        TunnelName::Subdomain(_) => self.http_proxy_port,
+                        TunnelName::PortNumber(_) => self.tcp_proxy_port,
+                    };
+                    return Some(Tunnel::from(SocketAddr::new(server.ip(), proxy_port)));
+                }
+                _ => continue,
+            }
+        }
+
+        None
     }
 
     pub async fn remove_tunnel(&self, tun_id: TunnelId) {
@@ -273,14 +390,14 @@ pub struct TunnelMetadata {
     pub written_bytes: usize,
 }
 
-pub struct TunnelEntry {
+pub struct TunnelEntry<R: PeerResolver> {
     tun_id: TunnelId,
     name: TunnelName,
-    registry: Arc<Tunnels>,
+    registry: Arc<Tunnels<R>>,
     persisted: bool,
 }
 
-impl TunnelEntry {
+impl<R: PeerResolver> TunnelEntry<R> {
     pub fn id(&self) -> TunnelId {
         self.tun_id
     }
@@ -300,7 +417,7 @@ impl TunnelEntry {
     }
 }
 
-impl Drop for TunnelEntry {
+impl<R: PeerResolver> Drop for TunnelEntry<R> {
     fn drop(&mut self) {
         if !self.persisted {
             let mut reg = self

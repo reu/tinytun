@@ -5,7 +5,7 @@ use tokio::{net::TcpListener, try_join};
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use tinytun_server::tunnel::Tunnels;
+use tinytun_server::tunnel::{DnsPeerResolver, Tunnels};
 use tinytun_server::{start_api, start_http_proxy, start_metadata_api, start_tcp_proxy};
 
 #[tokio::main]
@@ -46,7 +46,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     });
     let base_domain = Arc::new(base_domain);
 
-    let tuns = Arc::new(Tunnels::new());
+    // TODO: we must add object safety to PeerResolver, so we can conditially change it here
+    let resolver = DnsPeerResolver::new("tinytun.internal", metadata_port);
+    let tuns = Arc::new(Tunnels::with_peer_proxy_ports(resolver, proxy_port, tcp_proxy_port));
 
     let conn_listener = TcpListener::bind(("0.0.0.0", conn_port)).await?;
     let metadata_listener = TcpListener::bind(("0.0.0.0", metadata_port)).await?;

@@ -68,9 +68,7 @@ jobs:
           args: --release --locked --package tinytun-client --target=${{ matrix.job.target }}
 
       - name: Strip debug information
-        run: strip target/${{ matrix.job.target }}/release/tinytun-client
-
-      - run: mv target/${{ matrix.job.target }}/release/tinytun-client target/${{ matrix.job.target }}/release/tinytun
+        run: strip target/${{ matrix.job.target }}/release/tinytun
 
       - name: Archive
         run: tar czf tinytun-${{ needs.release.outputs.release_version }}-${{ matrix.job.target }}.tar.gz -C target/${{ matrix.job.target }}/release tinytun
@@ -113,8 +111,6 @@ jobs:
         with:
           command: build
           args: --release --locked --package tinytun-client --target=${{ matrix.job.target }}
-
-      - run: mv target/${{ matrix.job.target }}/release/tinytun-client.exe target/${{ matrix.job.target }}/release/tinytun.exe
 
       - name: Archive
         run: 7z -y a tinytun-${{ needs.release.outputs.release_version }}-${{ matrix.job.target }}.exe.zip target/${{ matrix.job.target }}/release/tinytun.exe

@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "tinytun"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4.1.4", features = ["derive"] }
 http = "0.2.8"

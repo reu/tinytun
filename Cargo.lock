@@ -869,7 +869,7 @@ dependencies = [
 
 [[package]]
 name = "tinytun"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "h2",
@@ -880,7 +880,7 @@ dependencies = [
 
 [[package]]
 name = "tinytun-client"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "http",
@@ -890,7 +890,7 @@ dependencies = [
 
 [[package]]
 name = "tinytun-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "h2",

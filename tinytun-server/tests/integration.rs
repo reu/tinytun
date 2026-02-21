@@ -6,10 +6,7 @@ use hyper::{
     Body, Request, Response, Server, StatusCode,
 };
 use tinytun::Tunnel;
-use tinytun_server::{
-    start_api, start_http_proxy, start_metadata_api,
-    tunnel::Tunnels,
-};
+use tinytun_server::{start_api, start_http_proxy, start_metadata_api, tunnel::Tunnels};
 use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -130,8 +127,7 @@ async fn test_http_proxy_round_trip() {
         while let Some(mut remote_stream) = tun.accept().await {
             let echo_addr = echo_addr;
             tokio::spawn(async move {
-                let mut local_stream =
-                    tokio::net::TcpStream::connect(echo_addr).await.unwrap();
+                let mut local_stream = tokio::net::TcpStream::connect(echo_addr).await.unwrap();
                 io::copy_bidirectional(&mut remote_stream, &mut local_stream)
                     .await
                     .ok();

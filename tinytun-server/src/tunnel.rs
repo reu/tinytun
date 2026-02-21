@@ -14,13 +14,13 @@ use hyper::Request;
 use pin_project_lite::pin_project;
 use rand::Rng;
 use serde::{Serialize, Serializer};
+use thiserror::Error;
 use tinytun::TunnelStream;
 use tokio::{
     io::{self, AsyncRead, AsyncWrite},
     net::TcpStream,
     time::{timeout, Duration},
 };
-use thiserror::Error;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -60,16 +60,21 @@ impl Tunnel {
         let mut client = timeout(CLIENT_READY_TIMEOUT, self.client.clone().ready())
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "H2 stream not ready"))??;
+
         let (res, send_stream) = client.send_request(Request::new(()), false)?;
+
         let res = timeout(SEND_REQUEST_TIMEOUT, res)
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "H2 send_request timed out"))??;
+
         let tunnel_stream = TunnelStream::new(res.into_body(), send_stream);
+
         let mut tunnel_stream = StreamMonitor {
             inner: tunnel_stream,
             read_bytes: self.read_bytes.clone(),
             written_bytes: self.written_bytes.clone(),
         };
+
         io::copy_bidirectional(&mut stream, &mut tunnel_stream).await?;
         Ok(())
     }
@@ -87,6 +92,12 @@ impl From<h2::client::SendRequest<Bytes>> for Tunnel {
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct TunnelId(Uuid);
+
+impl Default for TunnelId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl TunnelId {
     pub fn new() -> Self {
@@ -130,6 +141,12 @@ pub struct Tunnels {
     registry: RwLock<Registry>,
 }
 
+impl Default for Tunnels {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Tunnels {
     pub fn new() -> Self {
         Self {
@@ -163,7 +180,11 @@ impl Tunnels {
         })
     }
 
-    fn reserve_port(&self, port: Option<u16>, tun_id: TunnelId) -> Result<(TunnelName, u16), RegistryError> {
+    fn reserve_port(
+        &self,
+        port: Option<u16>,
+        tun_id: TunnelId,
+    ) -> Result<(TunnelName, u16), RegistryError> {
         let mut reg = self.registry.write().unwrap_or_else(|e| e.into_inner());
         match port {
             Some(port) => {
@@ -269,7 +290,11 @@ impl TunnelEntry {
     }
 
     pub async fn add_tunnel(&mut self, tunnel: Tunnel) {
-        let mut reg = self.registry.registry.write().unwrap_or_else(|e| e.into_inner());
+        let mut reg = self
+            .registry
+            .registry
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         reg.tunnels.insert(self.tun_id, (tunnel, self.name.clone()));
         self.persisted = true;
     }
@@ -278,7 +303,11 @@ impl TunnelEntry {
 impl Drop for TunnelEntry {
     fn drop(&mut self) {
         if !self.persisted {
-            let mut reg = self.registry.registry.write().unwrap_or_else(|e| e.into_inner());
+            let mut reg = self
+                .registry
+                .registry
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             reg.names.remove(&self.name);
         }
     }

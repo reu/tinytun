@@ -356,9 +356,7 @@ pub async fn start_http_proxy(
                 let tuns = tuns.clone();
                 tokio::spawn(async move {
                     let result: Result<(), Box<dyn Error + Send + Sync>> = async {
-                        let host = match timeout(HANDSHAKE_TIMEOUT, peek_host(&stream))
-                            .await
-                        {
+                        let host = match timeout(HANDSHAKE_TIMEOUT, peek_host(&stream)).await {
                             Ok(Ok(host)) => host,
                             Ok(Err(err)) => {
                                 // Health checks connect and close without sending data
@@ -529,7 +527,9 @@ pub async fn peek_host(stream: &TcpStream) -> Result<String, Box<dyn Error + Sen
 }
 
 // See: https://www.haproxy.org/download/2.4/doc/proxy-protocol.txt
-pub async fn parse_proxy_protocol(stream: &mut TcpStream) -> Result<u16, Box<dyn Error + Send + Sync>> {
+pub async fn parse_proxy_protocol(
+    stream: &mut TcpStream,
+) -> Result<u16, Box<dyn Error + Send + Sync>> {
     let mut header = [0_u8; 16];
     stream.read_exact(&mut header).await?;
 

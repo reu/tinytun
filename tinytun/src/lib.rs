@@ -318,6 +318,6 @@ fn h2_error_to_io_error(err: h2::Error) -> io::Error {
     if err.is_io() {
         err.into_io().unwrap()
     } else {
-        io::Error::new(io::ErrorKind::Other, err)
+        io::Error::other(err)
     }
 }

@@ -7,14 +7,23 @@
   };
 
   outputs = { self, nixpkgs, flake-utils }:
+    {
+      overlays.default = final: prev: {
+        tinytun = final.callPackage ./package.nix { };
+      };
+    }
+    //
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = nixpkgs.legacyPackages.${system};
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [ self.overlays.default ];
+        };
       in
       {
         packages = {
-          tinytun = pkgs.callPackage ./package.nix { };
-          default = self.packages.${system}.tinytun;
+          tinytun = pkgs.tinytun;
+          default = pkgs.tinytun;
         };
       }
     );

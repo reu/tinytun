@@ -40,6 +40,24 @@ end
 
 ## Installation
 
+### Pre-compiled binaries
+
+Download the latest release for your platform from the table below:
+
+| Platform | Architecture | Download |
+|---|---|---|
+| Linux (GNU) | x86_64 | [tinytun-x86_64-unknown-linux-gnu.tar.gz](https://github.com/reu/tinytun/releases/latest/download/tinytun-x86_64-unknown-linux-gnu.tar.gz) |
+| Linux (GNU) | i686 | [tinytun-i686-unknown-linux-gnu.tar.gz](https://github.com/reu/tinytun/releases/latest/download/tinytun-i686-unknown-linux-gnu.tar.gz) |
+| Linux (musl) | x86_64 | [tinytun-x86_64-unknown-linux-musl.tar.gz](https://github.com/reu/tinytun/releases/latest/download/tinytun-x86_64-unknown-linux-musl.tar.gz) |
+| Linux (musl) | i686 | [tinytun-i686-unknown-linux-musl.tar.gz](https://github.com/reu/tinytun/releases/latest/download/tinytun-i686-unknown-linux-musl.tar.gz) |
+| macOS | x86_64 (Intel) | [tinytun-x86_64-apple-darwin.tar.gz](https://github.com/reu/tinytun/releases/latest/download/tinytun-x86_64-apple-darwin.tar.gz) |
+| macOS | aarch64 (Apple Silicon) | [tinytun-aarch64-apple-darwin.tar.gz](https://github.com/reu/tinytun/releases/latest/download/tinytun-aarch64-apple-darwin.tar.gz) |
+| Windows (MSVC) | x86_64 | [tinytun-x86_64-pc-windows-msvc.exe.zip](https://github.com/reu/tinytun/releases/latest/download/tinytun-x86_64-pc-windows-msvc.exe.zip) |
+| Windows (MSVC) | i686 | [tinytun-i686-pc-windows-msvc.exe.zip](https://github.com/reu/tinytun/releases/latest/download/tinytun-i686-pc-windows-msvc.exe.zip) |
+| Windows (GNU) | x86_64 | [tinytun-x86_64-pc-windows-gnu.exe.zip](https://github.com/reu/tinytun/releases/latest/download/tinytun-x86_64-pc-windows-gnu.exe.zip) |
+
+See the [Releases](https://github.com/reu/tinytun/releases) page for all available versions.
+
 ### Using Nix
 
 ```sh

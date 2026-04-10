@@ -71,7 +71,7 @@ jobs:
         run: strip target/${{ matrix.job.target }}/release/tinytun
 
       - name: Archive
-        run: tar czf tinytun-${{ needs.release.outputs.release_version }}-${{ matrix.job.target }}.tar.gz -C target/${{ matrix.job.target }}/release tinytun
+        run: tar czf tinytun-${{ matrix.job.target }}.tar.gz -C target/${{ matrix.job.target }}/release tinytun
 
       - name: Upload release
         uses: actions/upload-release-asset@v1
@@ -79,8 +79,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ needs.release.outputs.release_upload_url }}
-          asset_path: tinytun-${{ needs.release.outputs.release_version }}-${{ matrix.job.target }}.tar.gz
-          asset_name: tinytun-${{ needs.release.outputs.release_version }}-${{ matrix.job.target }}.tar.gz
+          asset_path: tinytun-${{ matrix.job.target }}.tar.gz
+          asset_name: tinytun-${{ matrix.job.target }}.tar.gz
           asset_content_type: application/octet-stream
 
   build-win:
@@ -113,7 +113,7 @@ jobs:
           args: --release --locked --package tinytun-client --target=${{ matrix.job.target }}
 
       - name: Archive
-        run: 7z -y a tinytun-${{ needs.release.outputs.release_version }}-${{ matrix.job.target }}.exe.zip target/${{ matrix.job.target }}/release/tinytun.exe
+        run: 7z -y a tinytun-${{ matrix.job.target }}.exe.zip target/${{ matrix.job.target }}/release/tinytun.exe
 
       - name: Upload release
         uses: actions/upload-release-asset@v1
@@ -121,6 +121,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ needs.release.outputs.release_upload_url }}
-          asset_path: tinytun-${{ needs.release.outputs.release_version }}-${{ matrix.job.target }}.exe.zip
-          asset_name: tinytun-${{ needs.release.outputs.release_version }}-${{ matrix.job.target }}.exe.zip
+          asset_path: tinytun-${{ matrix.job.target }}.exe.zip
+          asset_name: tinytun-${{ matrix.job.target }}.exe.zip
           asset_content_type: application/zip

@@ -47,6 +47,7 @@ const CLIENT_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const SEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const PORT_RANGE: std::ops::Range<u16> = 20_000..60_000;
 const MAX_PORT_RETRIES: usize = 100;
+const PEER_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub trait PeerResolver: Send + Sync {
     fn resolve(&self) -> impl std::future::Future<Output = Vec<SocketAddr>> + Send;
@@ -343,18 +344,20 @@ impl<R: PeerResolver> Tunnels<R> {
         let http = hyper::Client::new();
         for server in self.peer_resolver.resolve().await {
             tracing::trace!("Querying {server} for {name}");
-            match http
-                .get(Uri::try_from(format!("http://{server}/tunnels/{name}")).unwrap())
-                .await
-            {
-                Ok(res) if res.status().is_success() => {
+            let query = http.get(Uri::try_from(format!("http://{server}/tunnels/{name}")).unwrap());
+            match timeout(PEER_QUERY_TIMEOUT, query).await {
+                Ok(Ok(res)) if res.status().is_success() => {
                     let proxy_port = match name {
                         TunnelName::Subdomain(_) => self.http_proxy_port,
                         TunnelName::PortNumber(_) => self.tcp_proxy_port,
                     };
                     return Some(Tunnel::from(SocketAddr::new(server.ip(), proxy_port)));
                 }
-                _ => continue,
+                Ok(_) => continue,
+                Err(_) => {
+                    tracing::warn!("Timed out querying peer {server} for {name}");
+                    continue;
+                }
             }
         }
 

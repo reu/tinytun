@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let proxy = async move {
         let mut retries = 0;
+        let mut announced = false;
 
         loop {
             let mut tun = match Tunnel::builder()
@@ -71,19 +72,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             {
                 Ok(tun) => tun,
                 Err(_err) => {
-                    sleep(Duration::from_secs(2)).await;
-
                     retries += 1;
                     if retries > 10 {
                         break;
                     }
-
+                    sleep(Duration::from_secs(2)).await;
                     continue;
                 }
             };
 
-            if retries == 0 {
+            // Connected: clear the consecutive-failure counter so that transient
+            // drops don't slowly exhaust the retry budget over the client's life.
+            retries = 0;
+
+            if !announced {
                 println!("Forwarding via: {}", tun.proxy_url());
+                announced = true;
             }
 
             while let Some(mut remote_stream) = tun.accept().await {
@@ -101,12 +105,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 });
             }
 
+            // The tunnel dropped (now detected promptly via keep-alive pings).
+            // Reconnect; `retries` only climbs if reconnection also fails.
             sleep(Duration::from_secs(2)).await;
-
-            retries += 1;
-            if retries > 20 {
-                break;
-            }
         }
 
         Ok::<_, Box<dyn Error + Send + Sync>>(())

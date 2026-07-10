@@ -5,10 +5,9 @@ use hyper::{
     service::{make_service_fn, service_fn},
     Body, Request, Response, Server, StatusCode,
 };
-use tinytun::Tunnel;
+use tinytun::{Tunnel, TunnelType};
 use tinytun_server::{
-    start_api, start_http_proxy, start_metadata_api,
-    tunnel::Tunnels,
+    start_api, start_http_proxy, start_metadata_api, start_tcp_proxy, tunnel::Tunnels,
 };
 use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt},
@@ -19,54 +18,52 @@ use tokio::{
 struct TestServer {
     api_addr: SocketAddr,
     proxy_addr: SocketAddr,
+    tcp_proxy_addr: SocketAddr,
     metadata_addr: SocketAddr,
 }
 
 impl TestServer {
-    async fn start() -> Self {
-        let tuns = Arc::new(Tunnels::default());
+    async fn spawn(tuns: Arc<Tunnels<Vec<SocketAddr>>>) -> Self {
         let base_domain = Arc::new("test.tinytun.local".to_string());
 
         let api_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let metadata_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 
         let api_addr = api_listener.local_addr().unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
+        let tcp_proxy_addr = tcp_proxy_listener.local_addr().unwrap();
         let metadata_addr = metadata_listener.local_addr().unwrap();
 
         tokio::spawn(start_api(tuns.clone(), base_domain.clone(), api_listener));
         tokio::spawn(start_http_proxy(tuns.clone(), proxy_listener));
+        tokio::spawn(start_tcp_proxy(tuns.clone(), tcp_proxy_listener));
         tokio::spawn(start_metadata_api(tuns.clone(), metadata_listener));
 
         TestServer {
             api_addr,
             proxy_addr,
+            tcp_proxy_addr,
             metadata_addr,
         }
     }
 
-    async fn start_with_peers(peers: Vec<SocketAddr>, http_proxy_port: u16) -> Self {
-        let tuns = Arc::new(Tunnels::with_peer_proxy_ports(peers, http_proxy_port, 0));
-        let base_domain = Arc::new("test.tinytun.local".to_string());
+    async fn start() -> Self {
+        Self::spawn(Arc::new(Tunnels::default())).await
+    }
 
-        let api_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let metadata_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-
-        let api_addr = api_listener.local_addr().unwrap();
-        let proxy_addr = proxy_listener.local_addr().unwrap();
-        let metadata_addr = metadata_listener.local_addr().unwrap();
-
-        tokio::spawn(start_api(tuns.clone(), base_domain.clone(), api_listener));
-        tokio::spawn(start_http_proxy(tuns.clone(), proxy_listener));
-        tokio::spawn(start_metadata_api(tuns.clone(), metadata_listener));
-
-        TestServer {
-            api_addr,
-            proxy_addr,
-            metadata_addr,
-        }
+    async fn start_with_peers(
+        peers: Vec<SocketAddr>,
+        http_proxy_port: u16,
+        tcp_proxy_port: u16,
+    ) -> Self {
+        Self::spawn(Arc::new(Tunnels::with_peer_proxy_ports(
+            peers,
+            http_proxy_port,
+            tcp_proxy_port,
+        )))
+        .await
     }
 
     fn server_url(&self) -> String {
@@ -189,6 +186,103 @@ async fn test_http_proxy_round_trip() {
     assert!(
         response_str.contains("hello world"),
         "response should echo back body, got: {response_str}"
+    );
+
+    forward_handle.abort();
+}
+
+/// Builds a minimal PROXY protocol v2 header (IPv4/TCP) advertising `dst_port`,
+/// matching what the server's TCP proxy parses.
+fn proxy_protocol_v2(dst_port: u16) -> Vec<u8> {
+    let mut header = vec![
+        0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // signature
+        0x21, // version 2, PROXY command
+        0x11, // AF_INET over STREAM
+        0x00, 0x0C, // address block length = 12
+    ];
+    header.extend_from_slice(&[0, 0, 0, 0]); // src addr
+    header.extend_from_slice(&[0, 0, 0, 0]); // dst addr
+    header.extend_from_slice(&0u16.to_be_bytes()); // src port
+    header.extend_from_slice(&dst_port.to_be_bytes()); // dst port
+    header
+}
+
+#[tokio::test]
+async fn test_remote_peer_tcp_forwarding() {
+    // Topology: [Echo Server] <-- [Server B: owns TCP tunnel] <-- [Server A: forwards] <-- [TCP Client]
+
+    // 1. Start Server B (no peers, owns the tunnel)
+    let server_b = TestServer::start().await;
+
+    // 2. Connect a TCP proxy tunnel client to Server B on a fixed virtual port
+    let virtual_port = 34567u16;
+    let mut tun = Tunnel::builder()
+        .server_url(server_b.server_url())
+        .tunnel_type(TunnelType::Tcp)
+        .port(virtual_port)
+        .listen()
+        .await
+        .expect("tcp tunnel should connect to server B");
+
+    // 3. Start a local TCP echo server
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = echo_listener.accept().await {
+            tokio::spawn(async move {
+                let (mut r, mut w) = stream.split();
+                io::copy(&mut r, &mut w).await.ok();
+            });
+        }
+    });
+
+    // 4. Spawn forwarder: tunnel streams -> echo server
+    let forward_handle = tokio::spawn(async move {
+        while let Some(mut remote_stream) = tun.accept().await {
+            tokio::spawn(async move {
+                let mut local_stream = tokio::net::TcpStream::connect(echo_addr).await.unwrap();
+                io::copy_bidirectional(&mut remote_stream, &mut local_stream)
+                    .await
+                    .ok();
+            });
+        }
+    });
+
+    // Give the tunnel time to register on Server B
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 5. Start Server A with Server B as a peer, pointing at Server B's TCP proxy port
+    let server_a = TestServer::start_with_peers(
+        vec![server_b.metadata_addr],
+        server_b.proxy_addr.port(),
+        server_b.tcp_proxy_addr.port(),
+    )
+    .await;
+
+    // 6. Connect to Server A's TCP proxy, send a PROXY header for the virtual
+    //    port, then some payload
+    let mut stream = tokio::net::TcpStream::connect(server_a.tcp_proxy_addr)
+        .await
+        .unwrap();
+    stream
+        .write_all(&proxy_protocol_v2(virtual_port))
+        .await
+        .unwrap();
+    stream.write_all(b"ping over tcp").await.unwrap();
+    stream.shutdown().await.unwrap();
+
+    // 7. Assert the payload is echoed back through the cross-server path
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .expect("should not timeout")
+        .expect("should read response");
+
+    assert_eq!(
+        String::from_utf8_lossy(&response),
+        "ping over tcp",
+        "payload should be echoed back through the remote peer"
     );
 
     forward_handle.abort();
@@ -349,11 +443,14 @@ async fn test_remote_peer_tunnel_forwarding() {
     let server_a = TestServer::start_with_peers(
         vec![server_b.metadata_addr],
         server_b.proxy_addr.port(),
+        server_b.tcp_proxy_addr.port(),
     )
     .await;
 
     // 6. Send an HTTP request to Server A's proxy with the remote tunnel's Host header
-    let mut stream = tokio::net::TcpStream::connect(server_a.proxy_addr()).await.unwrap();
+    let mut stream = tokio::net::TcpStream::connect(server_a.proxy_addr())
+        .await
+        .unwrap();
     let request = "POST / HTTP/1.1\r\nHost: remote-test.test.tinytun.local\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world";
     stream.write_all(request.as_bytes()).await.unwrap();
 

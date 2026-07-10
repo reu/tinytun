@@ -18,7 +18,7 @@ use serde::{Serialize, Serializer};
 use thiserror::Error;
 use tinytun::TunnelStream;
 use tokio::{
-    io::{self, AsyncRead, AsyncWrite},
+    io::{self, AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{self, TcpStream},
     time::{timeout, Duration},
 };
@@ -85,7 +85,14 @@ impl PeerResolver for Vec<SocketAddr> {
 #[derive(Debug, Clone)]
 enum TunnelConnection {
     Local(h2::client::SendRequest<Bytes>),
-    Remote(SocketAddr),
+    Remote {
+        addr: SocketAddr,
+        /// When set, a PROXY protocol v2 header advertising this destination
+        /// port is written before piping bytes, so the peer's TCP proxy can
+        /// route the connection. The original header was already consumed
+        /// while parsing it on this server, so it must be reconstructed.
+        proxy_protocol_port: Option<u16>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -123,8 +130,16 @@ impl Tunnel {
                 io::copy_bidirectional(&mut stream, &mut tunnel_stream).await?;
             }
 
-            TunnelConnection::Remote(addr) => {
+            TunnelConnection::Remote {
+                addr,
+                proxy_protocol_port,
+            } => {
                 let mut remote_stream = TcpStream::connect(addr).await?;
+                if let Some(port) = proxy_protocol_port {
+                    remote_stream
+                        .write_all(&proxy_protocol_v2_header(port))
+                        .await?;
+                }
                 io::copy_bidirectional(&mut stream, &mut remote_stream).await?;
             }
         };
@@ -142,14 +157,42 @@ impl From<h2::client::SendRequest<Bytes>> for Tunnel {
     }
 }
 
-impl From<SocketAddr> for Tunnel {
-    fn from(addr: SocketAddr) -> Self {
+impl Tunnel {
+    /// Builds a tunnel that forwards to a peer server at `addr`. When
+    /// `proxy_protocol_port` is set, a reconstructed PROXY protocol v2 header
+    /// carrying that port precedes the piped bytes so the peer's TCP proxy can
+    /// route the connection.
+    fn remote(addr: SocketAddr, proxy_protocol_port: Option<u16>) -> Self {
         Tunnel {
-            connection: TunnelConnection::Remote(addr),
+            connection: TunnelConnection::Remote {
+                addr,
+                proxy_protocol_port,
+            },
             read_bytes: Default::default(),
             written_bytes: Default::default(),
         }
     }
+}
+
+/// Builds a minimal PROXY protocol v2 header (IPv4 over TCP) advertising
+/// `dst_port` as the destination port. It reconstructs exactly the subset of
+/// the protocol that `parse_proxy_protocol` reads back, used when forwarding a
+/// TCP proxy connection to a peer server: the peer routes by destination port,
+/// but this server already consumed the original header while parsing it.
+fn proxy_protocol_v2_header(dst_port: u16) -> [u8; 28] {
+    let mut header = [0u8; 28];
+    // 12-byte signature.
+    header[..12].copy_from_slice(b"\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A");
+    // Version 2 + PROXY command.
+    header[12] = 0x21;
+    // AF_INET over STREAM.
+    header[13] = 0x11;
+    // Address block length (src addr + dst addr + src port + dst port = 12).
+    header[14..16].copy_from_slice(&12u16.to_be_bytes());
+    // Destination port; the remaining address fields stay zero, as the peer
+    // routes solely by destination port.
+    header[26..28].copy_from_slice(&dst_port.to_be_bytes());
+    header
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
@@ -341,17 +384,25 @@ impl<R: PeerResolver> Tunnels<R> {
             }
         }
 
+        // The lookup key must be the bare name (no `:` prefix that `Display`
+        // adds for ports) so the peer's metadata endpoint can match it.
+        let key = match name {
+            TunnelName::Subdomain(subdomain) => subdomain.clone(),
+            TunnelName::PortNumber(port) => port.to_string(),
+        };
+
         let http = hyper::Client::new();
         for server in self.peer_resolver.resolve().await {
             tracing::trace!("Querying {server} for {name}");
-            let query = http.get(Uri::try_from(format!("http://{server}/tunnels/{name}")).unwrap());
+            let query = http.get(Uri::try_from(format!("http://{server}/tunnels/{key}")).unwrap());
             match timeout(PEER_QUERY_TIMEOUT, query).await {
                 Ok(Ok(res)) if res.status().is_success() => {
-                    let proxy_port = match name {
-                        TunnelName::Subdomain(_) => self.http_proxy_port,
-                        TunnelName::PortNumber(_) => self.tcp_proxy_port,
+                    let (proxy_port, proxy_protocol_port) = match name {
+                        TunnelName::Subdomain(_) => (self.http_proxy_port, None),
+                        TunnelName::PortNumber(port) => (self.tcp_proxy_port, Some(*port)),
                     };
-                    return Some(Tunnel::from(SocketAddr::new(server.ip(), proxy_port)));
+                    let addr = SocketAddr::new(server.ip(), proxy_port);
+                    return Some(Tunnel::remote(addr, proxy_protocol_port));
                 }
                 Ok(_) => continue,
                 Err(_) => {

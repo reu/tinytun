@@ -48,7 +48,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // TODO: we must add object safety to PeerResolver, so we can conditially change it here
     let resolver = DnsPeerResolver::new("tinytun.internal", metadata_port);
-    let tuns = Arc::new(Tunnels::with_peer_proxy_ports(resolver, proxy_port, tcp_proxy_port));
+    let tuns = Arc::new(Tunnels::with_peer_proxy_ports(
+        resolver,
+        proxy_port,
+        tcp_proxy_port,
+    ));
 
     let conn_listener = TcpListener::bind(("0.0.0.0", conn_port)).await?;
     let metadata_listener = TcpListener::bind(("0.0.0.0", metadata_port)).await?;

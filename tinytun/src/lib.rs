@@ -8,17 +8,27 @@ use std::{
 };
 
 use bytes::{Buf, Bytes};
-use h2::{server::Connection, Reason, RecvStream, SendStream};
+use h2::{server::Connection, Ping, PingPong, Reason, RecvStream, SendStream};
 use hyper::{
     upgrade::{self, Upgraded},
     Body, Client, Method, Request, Response, Uri,
 };
 use hyper_rustls::HttpsConnectorBuilder;
-use tokio::io::{self, AsyncRead, AsyncWrite};
+use tokio::{
+    io::{self, AsyncRead, AsyncWrite},
+    time::{sleep, timeout, Duration},
+};
+
+/// How often the client sends an HTTP/2 PING to keep the tunnel alive and to
+/// detect a peer that has silently gone away.
+const PING_INTERVAL: Duration = Duration::from_secs(10);
+/// How long to wait for a PONG before considering the connection dead.
+const PING_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct Tunnel {
     proxy_url: String,
     connection: Connection<Upgraded, Bytes>,
+    ping_pong: Option<PingPong>,
 }
 
 impl Tunnel {
@@ -31,12 +41,45 @@ impl Tunnel {
     }
 
     pub async fn accept(&mut self) -> Option<TunnelStream> {
-        match self.connection.accept().await {
-            Some(Ok((req, mut respond))) => {
-                let sender = respond.send_response(Response::new(()), false).ok()?;
-                Some(TunnelStream::new(req.into_body(), sender))
-            }
-            _ => None,
+        // Borrow the fields separately so the keep-alive can drive the ping
+        // while `accept` waits on the same connection.
+        let Self {
+            connection,
+            ping_pong,
+            ..
+        } = self;
+
+        tokio::select! {
+            accepted = connection.accept() => match accepted {
+                Some(Ok((req, mut respond))) => {
+                    let sender = respond.send_response(Response::new(()), false).ok()?;
+                    Some(TunnelStream::new(req.into_body(), sender))
+                }
+                _ => None,
+            },
+            // `keep_alive` only resolves when a ping fails, i.e. the connection
+            // is dead even though no clean close was observed (e.g. a half-open
+            // network drop). Report it as end-of-stream so the caller reconnects.
+            _ = keep_alive(ping_pong) => None,
+        }
+    }
+}
+
+/// Sends periodic HTTP/2 PINGs and resolves only once one goes unanswered,
+/// letting [`Tunnel::accept`] treat a silently-dropped connection as closed.
+/// When no [`PingPong`] is available it never resolves, so `accept` waits solely
+/// on incoming streams.
+async fn keep_alive(ping_pong: &mut Option<PingPong>) {
+    let Some(ping_pong) = ping_pong.as_mut() else {
+        std::future::pending::<()>().await;
+        return;
+    };
+
+    loop {
+        sleep(PING_INTERVAL).await;
+        match timeout(PING_TIMEOUT, ping_pong.ping(Ping::opaque())).await {
+            Ok(Ok(_)) => continue,
+            _ => return,
         }
     }
 }
@@ -196,14 +239,16 @@ impl TunnelBuilder {
         };
 
         let remote = upgrade::on(res).await?;
-        let connection = h2::server::Builder::new()
+        let mut connection = h2::server::Builder::new()
             .max_concurrent_streams(self.max_concurrent_streams)
             .handshake(remote)
             .await?;
+        let ping_pong = connection.ping_pong();
 
         Ok(Tunnel {
             proxy_url,
             connection,
+            ping_pong,
         })
     }
 }

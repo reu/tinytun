@@ -12,6 +12,7 @@ use tinytun_server::{
 use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
+    task::JoinHandle,
     time::timeout,
 };
 
@@ -20,6 +21,7 @@ struct TestServer {
     proxy_addr: SocketAddr,
     tcp_proxy_addr: SocketAddr,
     metadata_addr: SocketAddr,
+    metadata_handle: JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
 }
 
 impl TestServer {
@@ -39,14 +41,21 @@ impl TestServer {
         tokio::spawn(start_api(tuns.clone(), base_domain.clone(), api_listener));
         tokio::spawn(start_http_proxy(tuns.clone(), proxy_listener));
         tokio::spawn(start_tcp_proxy(tuns.clone(), tcp_proxy_listener));
-        tokio::spawn(start_metadata_api(tuns.clone(), metadata_listener));
+        let metadata_handle = tokio::spawn(start_metadata_api(tuns.clone(), metadata_listener));
 
         TestServer {
             api_addr,
             proxy_addr,
             tcp_proxy_addr,
             metadata_addr,
+            metadata_handle,
         }
+    }
+
+    /// Aborts the metadata API task so peers can no longer resolve tunnels
+    /// hosted here (the proxy keeps running).
+    fn stop_metadata(&self) {
+        self.metadata_handle.abort();
     }
 
     async fn start() -> Self {
@@ -283,6 +292,96 @@ async fn test_remote_peer_tcp_forwarding() {
         String::from_utf8_lossy(&response),
         "ping over tcp",
         "payload should be echoed back through the remote peer"
+    );
+
+    forward_handle.abort();
+}
+
+async fn http_request(addr: SocketAddr, host: &str, body: &str) -> String {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .expect("should not timeout")
+        .expect("should read response");
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+#[tokio::test]
+async fn test_remote_peer_resolution_is_cached() {
+    // The first request resolves the tunnel's location via the peer's metadata
+    // API and caches it; a second request must still succeed from cache even
+    // after the peer's metadata API is taken down.
+
+    let server_b = TestServer::start().await;
+
+    let mut tun = Tunnel::builder()
+        .server_url(server_b.server_url())
+        .subdomain("cached-remote".to_string())
+        .listen()
+        .await
+        .expect("tunnel should connect to server B");
+
+    // Echo server that reflects the request body.
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder(AddrIncoming::from_listener(echo_listener).unwrap())
+            .serve(make_service_fn(|_| async {
+                Ok::<_, hyper::Error>(service_fn(|req: Request<Body>| async move {
+                    let body = hyper::body::to_bytes(req.into_body()).await.unwrap();
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Body::from(body))
+                }))
+            }))
+            .await
+    });
+
+    let forward_handle = tokio::spawn(async move {
+        while let Some(mut remote_stream) = tun.accept().await {
+            tokio::spawn(async move {
+                let mut local_stream = tokio::net::TcpStream::connect(echo_addr).await.unwrap();
+                io::copy_bidirectional(&mut remote_stream, &mut local_stream)
+                    .await
+                    .ok();
+            });
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let server_a = TestServer::start_with_peers(
+        vec![server_b.metadata_addr],
+        server_b.proxy_addr.port(),
+        server_b.tcp_proxy_addr.port(),
+    )
+    .await;
+
+    let host = "cached-remote.test.tinytun.local";
+
+    // First request populates Server A's peer-location cache.
+    let first = http_request(server_a.proxy_addr(), host, "first").await;
+    assert!(
+        first.contains("200") && first.contains("first"),
+        "first request should succeed, got: {first}"
+    );
+
+    // Take down Server B's metadata API. A fresh resolution would now fail, so
+    // a successful second request proves the cached location was reused.
+    server_b.stop_metadata();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let second = http_request(server_a.proxy_addr(), host, "second").await;
+    assert!(
+        second.contains("200") && second.contains("second"),
+        "second request should be served from cache, got: {second}"
     );
 
     forward_handle.abort();

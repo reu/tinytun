@@ -8,6 +8,7 @@ use std::{
         Arc, RwLock,
     },
     task::{self, ready},
+    time::Instant,
 };
 
 use bytes::Bytes;
@@ -48,6 +49,9 @@ const SEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const PORT_RANGE: std::ops::Range<u16> = 20_000..60_000;
 const MAX_PORT_RETRIES: usize = 100;
 const PEER_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+const PEER_CACHE_TTL: Duration = Duration::from_secs(10);
+const PEER_CACHE_NEGATIVE_TTL: Duration = Duration::from_secs(2);
+const PEER_CACHE_MAX_ENTRIES: usize = 4096;
 
 pub trait PeerResolver: Send + Sync {
     fn resolve(&self) -> impl std::future::Future<Output = Vec<SocketAddr>> + Send;
@@ -251,9 +255,26 @@ struct Registry {
     names: HashMap<TunnelName, TunnelId>,
 }
 
+/// A tunnel resolved to live on a peer server, as returned by a metadata query.
+#[derive(Debug, Clone, Copy)]
+struct RemoteLocation {
+    addr: SocketAddr,
+    proxy_protocol_port: Option<u16>,
+}
+
+/// A cached peer resolution. `location` is `None` for a negative result (the
+/// name was not found on any peer), cached briefly so a flood of requests for
+/// an unknown name doesn't sweep every peer each time.
+struct PeerCacheEntry {
+    location: Option<RemoteLocation>,
+    expires_at: Instant,
+}
+
 pub struct Tunnels<R: PeerResolver> {
     registry: RwLock<Registry>,
     peer_resolver: R,
+    peer_cache: RwLock<HashMap<TunnelName, PeerCacheEntry>>,
+    http: hyper::Client<hyper::client::HttpConnector>,
     http_proxy_port: u16,
     tcp_proxy_port: u16,
 }
@@ -266,15 +287,7 @@ impl Default for Tunnels<Vec<SocketAddr>> {
 
 impl<R: PeerResolver> Tunnels<R> {
     pub fn new(peer_resolver: R) -> Self {
-        Self {
-            registry: RwLock::new(Registry {
-                tunnels: HashMap::new(),
-                names: HashMap::new(),
-            }),
-            peer_resolver,
-            http_proxy_port: 5555,
-            tcp_proxy_port: 5556,
-        }
+        Self::with_peer_proxy_ports(peer_resolver, 5555, 5556)
     }
 
     pub fn with_peer_proxy_ports(
@@ -288,6 +301,8 @@ impl<R: PeerResolver> Tunnels<R> {
                 names: HashMap::new(),
             }),
             peer_resolver,
+            peer_cache: RwLock::new(HashMap::new()),
+            http: hyper::Client::new(),
             http_proxy_port,
             tcp_proxy_port,
         }
@@ -375,6 +390,7 @@ impl<R: PeerResolver> Tunnels<R> {
     }
 
     pub async fn tunnel_for_name(&self, name: &TunnelName) -> Option<Tunnel> {
+        // 1. Locally-registered tunnel.
         {
             let reg = self.registry.read().unwrap_or_else(|e| e.into_inner());
             if let Some(tun_id) = reg.names.get(name) {
@@ -384,6 +400,51 @@ impl<R: PeerResolver> Tunnels<R> {
             }
         }
 
+        // 2. A recent peer resolution, if still fresh.
+        if let Some(location) = self.cached_peer_location(name) {
+            return location.map(|loc| Tunnel::remote(loc.addr, loc.proxy_protocol_port));
+        }
+
+        // 3. Ask the peers and remember the outcome (positive or negative).
+        let location = self.resolve_peer_location(name).await;
+        self.cache_peer_location(name.clone(), location);
+        location.map(|loc| Tunnel::remote(loc.addr, loc.proxy_protocol_port))
+    }
+
+    /// Returns a fresh cached resolution for `name`: `Some(Some(loc))` if it is
+    /// known to live on a peer, `Some(None)` if it is known-absent, or `None`
+    /// when there is no fresh entry and the peers must be queried.
+    fn cached_peer_location(&self, name: &TunnelName) -> Option<Option<RemoteLocation>> {
+        let cache = self.peer_cache.read().unwrap_or_else(|e| e.into_inner());
+        let entry = cache.get(name)?;
+        if entry.expires_at <= Instant::now() {
+            return None;
+        }
+        Some(entry.location)
+    }
+
+    fn cache_peer_location(&self, name: TunnelName, location: Option<RemoteLocation>) {
+        let ttl = if location.is_some() {
+            PEER_CACHE_TTL
+        } else {
+            PEER_CACHE_NEGATIVE_TTL
+        };
+        let entry = PeerCacheEntry {
+            location,
+            expires_at: Instant::now() + ttl,
+        };
+
+        let mut cache = self.peer_cache.write().unwrap_or_else(|e| e.into_inner());
+        // Bound memory: before inserting a new key into a full cache, drop any
+        // entries that have already expired (e.g. a flood of unknown names).
+        if cache.len() >= PEER_CACHE_MAX_ENTRIES && !cache.contains_key(&name) {
+            let now = Instant::now();
+            cache.retain(|_, entry| entry.expires_at > now);
+        }
+        cache.insert(name, entry);
+    }
+
+    async fn resolve_peer_location(&self, name: &TunnelName) -> Option<RemoteLocation> {
         // The lookup key must be the bare name (no `:` prefix that `Display`
         // adds for ports) so the peer's metadata endpoint can match it.
         let key = match name {
@@ -391,18 +452,21 @@ impl<R: PeerResolver> Tunnels<R> {
             TunnelName::PortNumber(port) => port.to_string(),
         };
 
-        let http = hyper::Client::new();
         for server in self.peer_resolver.resolve().await {
             tracing::trace!("Querying {server} for {name}");
-            let query = http.get(Uri::try_from(format!("http://{server}/tunnels/{key}")).unwrap());
+            let query = self
+                .http
+                .get(Uri::try_from(format!("http://{server}/tunnels/{key}")).unwrap());
             match timeout(PEER_QUERY_TIMEOUT, query).await {
                 Ok(Ok(res)) if res.status().is_success() => {
                     let (proxy_port, proxy_protocol_port) = match name {
                         TunnelName::Subdomain(_) => (self.http_proxy_port, None),
                         TunnelName::PortNumber(port) => (self.tcp_proxy_port, Some(*port)),
                     };
-                    let addr = SocketAddr::new(server.ip(), proxy_port);
-                    return Some(Tunnel::remote(addr, proxy_protocol_port));
+                    return Some(RemoteLocation {
+                        addr: SocketAddr::new(server.ip(), proxy_port),
+                        proxy_protocol_port,
+                    });
                 }
                 Ok(_) => continue,
                 Err(_) => {

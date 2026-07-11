@@ -3,28 +3,42 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs = { self, nixpkgs }:
+    let
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "aarch64-darwin"
+      ];
+      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f (import nixpkgs {
+        inherit system;
+        overlays = [ self.overlays.default ];
+      }));
+    in
     {
       overlays.default = final: prev: {
         tinytun = final.callPackage ./package.nix { };
       };
-    }
-    //
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        pkgs = import nixpkgs {
-          inherit system;
-          overlays = [ self.overlays.default ];
+
+      packages = forAllSystems (pkgs: {
+        tinytun = pkgs.tinytun;
+        default = pkgs.tinytun;
+      });
+
+      devShells = forAllSystems (pkgs: {
+        default = pkgs.mkShell {
+          inputsFrom = [ pkgs.tinytun ];
+          packages = [
+            pkgs.rustfmt
+            pkgs.clippy
+            pkgs.rust-analyzer
+          ];
         };
-      in
-      {
-        packages = {
-          tinytun = pkgs.tinytun;
-          default = pkgs.tinytun;
-        };
-      }
-    );
+      });
+
+      formatter = forAllSystems (pkgs: pkgs.nixfmt);
+    };
 }

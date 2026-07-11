@@ -3,9 +3,9 @@
   rustPlatform,
 }:
 
-rustPlatform.buildRustPackage {
+rustPlatform.buildRustPackage (finalAttrs: {
   pname = "tinytun";
-  version = "0.4.0";
+  version = "0.4.2";
 
   src = lib.cleanSource ./.;
 
@@ -16,7 +16,7 @@ rustPlatform.buildRustPackage {
   cargoBuildFlags = [ "-p" "tinytun-client" ];
   doCheck = false;
 
-  cargoHash = "sha256-HQzL06x8+BuSLanReRipUAFiMk9XAlt6ANTF6cK8wpA=";
+  cargoHash = "sha256-PlaR0AejWDrL0tN6aszHy5jI2ZNRJwu+FDa8Zp6F23Q=";
 
   meta = {
     description = "Expose local web servers on the internet";
@@ -24,4 +24,4 @@ rustPlatform.buildRustPackage {
     license = lib.licenses.mit;
     mainProgram = "tinytun";
   };
-}
+})
